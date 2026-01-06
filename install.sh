@@ -73,35 +73,66 @@ fi
 pip install --upgrade numpy pillow zwoasi
 
 echo "=== [5/9] Descargar e instalar ASICamera2 SDK (ZWO) ==="
+
 TMP_DIR="${PROJECT_DIR}/.tmp_zwo"
 rm -rf "${TMP_DIR}"
 mkdir -p "${TMP_DIR}"
+cd "${TMP_DIR}"
 
-# URL genérica; si ZWO cambia versión, igual buscamos el .so dentro
-SDK_URL="https://astronomy-imaging-camera.com/software/ASI_linux_mac_SDK_V1.30.tar.bz2"
-SDK_TARBZ2="${TMP_DIR}/ASI_SDK.tar.bz2"
+SDK_ZIP="ASI_Camera_SDK.zip"
 
-echo "-> Descargando SDK: ${SDK_URL}"
-curl -L "${SDK_URL}" -o "${SDK_TARBZ2}"
+echo "-> Descargando SDK (endpoint nuevo de ZWO)..."
+curl -fL --retry 3 -A "Mozilla/5.0" \
+  -e "https://www.zwoastro.com/" \
+  -OJ "https://dl.zwoastro.com/software?app=DeveloperCameraSdk&platform=linux&region=Overseas"
 
-echo "-> Extrayendo SDK..."
-tar -xjf "${SDK_TARBZ2}" -C "${TMP_DIR}"
+# Detectar el zip descargado (nombre viene por Content-Disposition)
+ZIP_FILE="$(ls *.zip | head -n 1 || true)"
+if [[ -z "${ZIP_FILE}" ]]; then
+  echo "❌ No se descargó ningún archivo ZIP del SDK."
+  exit 1
+fi
 
-echo "-> Buscando libASICamera2.so* dentro del SDK..."
-FOUND_LIB="$(find "${TMP_DIR}" -type f \( -name "libASICamera2.so" -o -name "libASICamera2.so.*" \) | head -n 1 || true)"
+echo "-> ZIP descargado: ${ZIP_FILE}"
+file "${ZIP_FILE}"
+
+echo "-> Extrayendo ZIP..."
+unzip -q "${ZIP_FILE}"
+
+# Buscar el tar.bz2 dentro
+SDK_TARBZ2="$(find . -name "ASI_linux_mac_SDK_*.tar.bz2" | head -n 1 || true)"
+if [[ -z "${SDK_TARBZ2}" ]]; then
+  echo "❌ No se encontró ASI_linux_mac_SDK_*.tar.bz2 dentro del ZIP."
+  exit 1
+fi
+
+echo "-> Encontrado SDK tar.bz2: ${SDK_TARBZ2}"
+file "${SDK_TARBZ2}"
+
+echo "-> Extrayendo SDK tar.bz2..."
+tar -xjf "${SDK_TARBZ2}"
+
+echo "-> Buscando libASICamera2.so..."
+FOUND_LIB="$(find . -type f -name 'libASICamera2.so*' | head -n 1 || true)"
 if [[ -z "${FOUND_LIB}" ]]; then
-  echo ""
-  echo "❌ No encontré libASICamera2.so* dentro del SDK descargado."
-  echo "   Revisa el contenido en: ${TMP_DIR}"
+  echo "❌ No se encontró libASICamera2.so dentro del SDK."
   exit 1
 fi
 
 echo "-> Encontrado: ${FOUND_LIB}"
+
 BASE_NAME="$(basename "${FOUND_LIB}")"
 
-echo "-> Copiando a /usr/local/lib/${BASE_NAME}"
+echo "-> Instalando en /usr/local/lib/${BASE_NAME}"
 sudo cp -f "${FOUND_LIB}" "/usr/local/lib/${BASE_NAME}"
 sudo chmod 644 "/usr/local/lib/${BASE_NAME}"
+
+echo "-> Creando symlink libASICamera2.so"
+sudo ln -sf "/usr/local/lib/${BASE_NAME}" /usr/local/lib/libASICamera2.so
+
+echo "-> Actualizando linker cache"
+echo "/usr/local/lib" | sudo tee /etc/ld.so.conf.d/local-zwo.conf >/dev/null
+sudo ldconfig
 
 echo "=== [6/9] Crear symlink /usr/local/lib/libASICamera2.so ==="
 # Si la encontrada ya es libASICamera2.so, igual lo linkeamos a sí misma
