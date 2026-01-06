@@ -1,67 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
+cd "$(cd "$(dirname "$0")" && pwd)"
 
-PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VENV_DIR="${PROJECT_DIR}/venv"
-APP="${PROJECT_DIR}/astrocam.py"
+source "./venv/bin/activate"
 
-echo "=== Astro Capture App ==="
-
-# 1) Verificar venv
-if [[ ! -d "${VENV_DIR}" ]]; then
-  echo "❌ No se encontró el entorno virtual:"
-  echo "   ${VENV_DIR}"
-  echo "   Ejecuta primero: ./install.sh"
-  exit 1
+# Cargar env ZWO (SDK)
+if [[ -f "./env.sh" ]]; then
+  source "./env.sh"
 fi
 
-# 2) Activar venv
-# shellcheck disable=SC1091
-source "${VENV_DIR}/bin/activate"
+echo "=== Self-check ZWO SDK ==="
+echo "ASI_SDK_LIB=${ASI_SDK_LIB:-}"
+echo "ZWO_ASI_LIB=${ZWO_ASI_LIB:-}"
+ls -l "${ASI_SDK_LIB:-/usr/local/lib/libASICamera2.so}" || true
+ldconfig -p | grep -i ASICamera2 || true
+echo "=========================="
 
-# 3) Verificar archivo principal
-if [[ ! -f "${APP}" ]]; then
-  echo "❌ No se encontró el archivo principal:"
-  echo "   ${APP}"
-  exit 1
-fi
-
-# 4) Detectar backend Qt instalado
-echo "→ Verificando backend Qt..."
-QT_BACKEND=""
-
-python3 - <<'EOF'
-try:
-    import PySide6
-    print("PySide6")
-except Exception:
-    try:
-        import PyQt5
-        print("PyQt5")
-    except Exception:
-        print("NONE")
-EOF
-QT_BACKEND=$(python3 - <<'EOF'
-try:
-    import PySide6
-    print("PySide6")
-except Exception:
-    try:
-        import PyQt5
-        print("PyQt5")
-    except Exception:
-        print("NONE")
-EOF
-)
-
-if [[ "${QT_BACKEND}" == "NONE" ]]; then
-  echo "❌ No se encontró PySide6 ni PyQt5 en el venv."
-  echo "   Ejecuta nuevamente: ./install.sh"
-  exit 1
-fi
-
-echo "→ Backend Qt detectado: ${QT_BACKEND}"
-
-# 5) Ejecutar aplicación
-echo "→ Iniciando aplicación..."
-python3 "${APP}"
+python3 "astro_capture_app_zwo.py"
