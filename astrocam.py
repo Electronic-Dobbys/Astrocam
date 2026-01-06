@@ -2,33 +2,23 @@
 # -*- coding: utf-8 -*-
 """
 Astro Capture App (Demo) - PySide6
-- Fullscreen capture UI with live preview
-- Config panel (exposure seconds, gain, images per block, blocks, session name)
-- Block-based capture: pauses between blocks and resumes with START
-- Session folders under a base path from config.json (auto-created)
-- Gallery window: folder tree + thumbnail grid (defaults to current session)
-- Viewer window: fullscreen image with transparent overlay buttons (delete, zoom in/out, fit)
 
-This is a COMPLETE runnable demo using a MOCK camera (synthetic star field).
-Later you can swap MockCamera for a real ZWO backend.
+NUEVO:
+- Botón PREVIEW (una captura usando exposición/ganancia actuales, sin guardar)
+- Botón CÁMARA (config / conectar / desconectar / seleccionar si hay más de una)
+
+Este demo sigue usando MockCamera, pero la arquitectura deja listo el paso a ZWO real.
 
 Requirements:
   pip install PySide6 numpy
-
 Run:
   python3 astro_capture_app.py
-
-Keys:
-  F11 toggle fullscreen
-  Esc exit fullscreen
 """
 
 import os
 import sys
 import json
 import time
-import math
-import shutil
 import random
 import pathlib
 from dataclasses import dataclass
@@ -37,17 +27,18 @@ from datetime import datetime
 import numpy as np
 
 from PySide6.QtCore import (
-    Qt, QSize, QRect, QPoint, QThread, Signal, QObject, QMutex, QWaitCondition
+    Qt, QSize, QRect, QThread, Signal, QObject, QMutex, QWaitCondition
 )
 from PySide6.QtGui import (
-    QImage, QPixmap, QAction, QFont, QIcon
+    QImage, QPixmap, QAction, QIcon
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
-    QFormLayout, QLineEdit, QSpinBox, QDoubleSpinBox, QSlider, QPushButton,
+    QFormLayout, QLineEdit, QSpinBox, QDoubleSpinBox, QPushButton,
     QGroupBox, QMessageBox, QFileSystemModel, QTreeView, QScrollArea,
     QGridLayout, QFrame, QToolButton, QGraphicsView, QGraphicsScene,
-    QGraphicsPixmapItem, QSizePolicy, QSplitter
+    QGraphicsPixmapItem, QSizePolicy, QSplitter,
+    QDialog, QDialogButtonBox, QComboBox
 )
 
 
@@ -80,7 +71,6 @@ def load_or_create_config() -> dict:
     if "preview_format" not in cfg:
         cfg["preview_format"] = "png"
 
-    # persist sanitized config
     os.makedirs(cfg["base_path"], exist_ok=True)
     with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
@@ -108,20 +98,16 @@ class MockCamera:
     Produces a 16-bit grayscale synthetic "star field" image.
     Uses exposure_s & gain to modulate brightness/noise.
     """
-
-    def __init__(self, width=1280, height=720):
+    def __init__(self, width=1280, height=720, name="MockCam"):
         self.width = int(width)
         self.height = int(height)
+        self.name = name
 
     def capture_frame_u16(self, exposure_s: float, gain: int) -> np.ndarray:
-        # Simulate exposure time delay a bit (but don't block too much)
-        # We'll cap the sleep so UI testing is pleasant.
         time.sleep(min(max(exposure_s, 0.05), 0.8))
-
         h, w = self.height, self.width
         img = np.zeros((h, w), dtype=np.float32)
 
-        # Background + vignetting
         yy, xx = np.mgrid[0:h, 0:w]
         cx, cy = w / 2.0, h / 2.0
         r = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2) / (0.9 * max(w, h))
@@ -129,7 +115,6 @@ class MockCamera:
         base = 300 + 80 * vignette
         img += base
 
-        # Stars: random gaussians
         n_stars = 180 + int(0.7 * gain)
         for _ in range(n_stars):
             x0 = random.uniform(0, w - 1)
@@ -140,24 +125,61 @@ class MockCamera:
             dy = yy - y0
             img += amp * np.exp(-(dx * dx + dy * dy) / (2 * sigma * sigma))
 
-        # Noise
         read_noise = 25 + (gain * 0.3)
         shot_scale = 0.02 + 0.005 * exposure_s
         noise = np.random.normal(0, read_noise, size=(h, w)).astype(np.float32)
         img = img + noise + shot_scale * np.sqrt(np.clip(img, 0, None)) * np.random.normal(0, 1, (h, w)).astype(np.float32)
 
-        # Clamp to 16-bit
         img = np.clip(img, 0, 65535).astype(np.uint16)
         return img
+
+
+# ----------------------------
+# Camera manager abstraction (Mock version)
+# ----------------------------
+class MockCameraManager:
+    """
+    Simula múltiples cámaras conectadas.
+    Esto se reemplaza luego por ZWO (list / connect / disconnect).
+    """
+    def __init__(self):
+        self._devices = [
+            MockCamera(1600, 900, "MockCam ASI294MC"),
+            MockCamera(1280, 720, "MockCam ASI462MC"),
+            MockCamera(1920, 1080, "MockCam ASI2600MM Pro"),
+        ]
+        self._connected_index = None
+
+    def list_cameras(self):
+        return [cam.name for cam in self._devices]
+
+    def is_connected(self) -> bool:
+        return self._connected_index is not None
+
+    def connected_name(self) -> str:
+        if self._connected_index is None:
+            return "Ninguna"
+        return self._devices[self._connected_index].name
+
+    def connect(self, index: int):
+        if index < 0 or index >= len(self._devices):
+            raise ValueError("Índice de cámara inválido.")
+        self._connected_index = index
+
+    def disconnect(self):
+        self._connected_index = None
+
+    def get_active_camera(self) -> MockCamera:
+        # si no hay conectada, conectamos por defecto la primera (para demo)
+        if self._connected_index is None:
+            self._connected_index = 0
+        return self._devices[self._connected_index]
 
 
 # ----------------------------
 # Image utilities
 # ----------------------------
 def stretch_u16_to_u8(img_u16: np.ndarray, lo_pct=1.0, hi_pct=99.7, gamma=0.9) -> np.ndarray:
-    """
-    Quick preview stretch: percentile clip + gamma, output uint8.
-    """
     a = img_u16.astype(np.float32)
     lo = np.percentile(a, lo_pct)
     hi = np.percentile(a, hi_pct)
@@ -166,16 +188,13 @@ def stretch_u16_to_u8(img_u16: np.ndarray, lo_pct=1.0, hi_pct=99.7, gamma=0.9) -
     a = (a - lo) / (hi - lo)
     a = np.clip(a, 0.0, 1.0)
     a = np.power(a, gamma)
-    out = (a * 255.0).astype(np.uint8)
-    return out
+    return (a * 255.0).astype(np.uint8)
 
 
 def gray_u8_to_qimage(gray_u8: np.ndarray) -> QImage:
     h, w = gray_u8.shape
-    # Ensure contiguous
     gray_u8_c = np.ascontiguousarray(gray_u8)
     qimg = QImage(gray_u8_c.data, w, h, w, QImage.Format_Grayscale8)
-    # Deep copy so numpy memory can be freed safely
     return qimg.copy()
 
 
@@ -191,7 +210,6 @@ class SessionManager:
         safe = safe.strip().replace(" ", "_")
         if not safe:
             safe = "Sesion"
-
         stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         folder = f"{safe}_{stamp}"
         path = os.path.join(self.base_path, folder)
@@ -221,33 +239,56 @@ class SessionManager:
 
 
 # ----------------------------
-# Capture worker (runs in thread)
+# Worker for a single preview shot (thread)
+# ----------------------------
+class PreviewWorker(QObject):
+    preview_ready = Signal(QImage, float, int, str)  # qimg, exposure, gain, camera_name
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(self, cam_manager: MockCameraManager, exposure_s: float, gain: int):
+        super().__init__()
+        self._cam_manager = cam_manager
+        self._exposure_s = exposure_s
+        self._gain = gain
+
+    def run(self):
+        try:
+            cam = self._cam_manager.get_active_camera()
+            img_u16 = cam.capture_frame_u16(self._exposure_s, self._gain)
+            gray_u8 = stretch_u16_to_u8(img_u16)
+            qimg = gray_u8_to_qimage(gray_u8)
+            self.preview_ready.emit(qimg, self._exposure_s, self._gain, cam.name)
+        except Exception as e:
+            self.error.emit(str(e))
+        finally:
+            self.finished.emit()
+
+
+# ----------------------------
+# Capture worker (runs in thread) - uses camera manager
 # ----------------------------
 class CaptureWorker(QObject):
-    frame_ready = Signal(QImage, str, int, int, int, int, int, float, int)  
-    # args: preview_qimg, saved_path, block_idx, blocks_total, idx_in_block, imgs_per_block, global_idx, exposure_s, gain
-    state_changed = Signal(str)  # "READY", "RUNNING", "PAUSED_BETWEEN_BLOCKS", "STOPPED", "DONE", "ERROR"
+    frame_ready = Signal(QImage, str, int, int, int, int, int, float, int, str)
+    # qimg, saved_path, block_idx, blocks_total, idx_in_block, imgs_per_block, global_idx, exposure_s, gain, camera_name
+    state_changed = Signal(str)
     error = Signal(str)
     session_created = Signal(str)
 
-    def __init__(self, base_path: str):
+    def __init__(self, base_path: str, cam_manager: MockCameraManager):
         super().__init__()
         self._base_path = base_path
+        self._cam_manager = cam_manager
         self._mutex = QMutex()
         self._cond = QWaitCondition()
-
         self._stop = False
         self._pause_waiting = False
 
-        self._camera = MockCamera(width=1600, height=900)
         self._session_mgr = SessionManager(base_path)
-
-        self._current_session_dir = ""
 
     def request_stop(self):
         self._mutex.lock()
         self._stop = True
-        # wake if paused
         self._pause_waiting = False
         self._cond.wakeAll()
         self._mutex.unlock()
@@ -265,17 +306,16 @@ class CaptureWorker(QObject):
             self._stop = False
             self._mutex.unlock()
 
-            # Create session
+            cam = self._cam_manager.get_active_camera()
+            cam_name = cam.name
+
             session_dir = self._session_mgr.create_session_dir(params.session_name)
-            self._current_session_dir = session_dir
             self._session_mgr.save_session_config(session_dir, params)
             self.session_created.emit(session_dir)
 
-            total_images = params.images_per_block * params.blocks
             global_idx = 0
 
             for b in range(1, params.blocks + 1):
-                # check stop
                 if self._should_stop():
                     self.state_changed.emit("STOPPED")
                     return
@@ -288,31 +328,21 @@ class CaptureWorker(QObject):
                         self.state_changed.emit("STOPPED")
                         return
 
-                    # Capture mock frame (u16)
-                    img_u16 = self._camera.capture_frame_u16(params.exposure_s, params.gain)
-
-                    # Preview: stretch u16 -> u8 -> QImage
+                    img_u16 = cam.capture_frame_u16(params.exposure_s, params.gain)
                     gray_u8 = stretch_u16_to_u8(img_u16)
                     qimg = gray_u8_to_qimage(gray_u8)
 
                     global_idx += 1
-
-                    # Save preview image
-                    out_path = self._session_mgr.make_preview_filename(
-                        block_dir=block_dir,
-                        global_index_1based=global_idx,
-                        ext="png"
-                    )
+                    out_path = self._session_mgr.make_preview_filename(block_dir, global_idx, "png")
                     qimg.save(out_path, "PNG")
 
                     self.frame_ready.emit(
                         qimg, out_path,
                         b, params.blocks,
                         i, params.images_per_block,
-                        global_idx, params.exposure_s, params.gain
+                        global_idx, params.exposure_s, params.gain, cam_name
                     )
 
-                # block complete -> pause if more blocks
                 if b < params.blocks:
                     self.state_changed.emit("PAUSED_BETWEEN_BLOCKS")
                     self._wait_for_resume_or_stop()
@@ -341,7 +371,89 @@ class CaptureWorker(QObject):
 
 
 # ----------------------------
-# Viewer window (fullscreen image + transparent buttons)
+# Camera config dialog
+# ----------------------------
+class CameraConfigDialog(QDialog):
+    def __init__(self, cam_manager: MockCameraManager, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Configuración de cámara")
+        self.setModal(True)
+        self._cam_manager = cam_manager
+
+        layout = QVBoxLayout(self)
+
+        self.lbl_status = QLabel("")
+        self.lbl_status.setStyleSheet("color: rgba(255,255,255,220); font-size: 14px;")
+        layout.addWidget(self.lbl_status)
+
+        self.combo = QComboBox()
+        self.combo.setStyleSheet("""
+            QComboBox {
+                background: rgba(0,0,0,120);
+                color: rgba(255,255,255,220);
+                border: 1px solid rgba(255,255,255,50);
+                border-radius: 8px;
+                padding: 6px;
+            }
+        """)
+        layout.addWidget(self.combo)
+
+        btn_row = QHBoxLayout()
+        self.btn_connect = QPushButton("Conectar")
+        self.btn_disconnect = QPushButton("Desconectar")
+
+        for b in [self.btn_connect, self.btn_disconnect]:
+            b.setStyleSheet("""
+                QPushButton {
+                    background: rgba(255,255,255,14);
+                    color: rgba(255,255,255,220);
+                    border: 1px solid rgba(255,255,255,50);
+                    border-radius: 12px;
+                    padding: 10px;
+                    font-size: 14px;
+                    font-weight: 700;
+                }
+                QPushButton:hover { background: rgba(255,255,255,22); }
+            """)
+        btn_row.addWidget(self.btn_connect)
+        btn_row.addWidget(self.btn_disconnect)
+        layout.addLayout(btn_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.setStyleSheet("QDialog { background: #0b0b0b; }")
+
+        self.btn_connect.clicked.connect(self._connect_selected)
+        self.btn_disconnect.clicked.connect(self._disconnect)
+
+        self._reload()
+
+    def _reload(self):
+        cams = self._cam_manager.list_cameras()
+        self.combo.clear()
+        self.combo.addItems(cams)
+        self._update_status()
+
+    def _update_status(self):
+        self.lbl_status.setText(f"Cámara conectada: {self._cam_manager.connected_name()}")
+
+    def _connect_selected(self):
+        try:
+            idx = self.combo.currentIndex()
+            self._cam_manager.connect(idx)
+            self._update_status()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    def _disconnect(self):
+        self._cam_manager.disconnect()
+        self._update_status()
+
+
+# ----------------------------
+# Viewer window (unchanged)
 # ----------------------------
 class ImageViewerWindow(QMainWindow):
     def __init__(self, image_path: str, on_deleted_callback=None, parent=None):
@@ -352,7 +464,6 @@ class ImageViewerWindow(QMainWindow):
 
         self._scene = QGraphicsScene(self)
         self._view = QGraphicsView(self._scene)
-        self._view.setRenderHints(self._view.renderHints() | self._view.renderHints())
         self._view.setFrameShape(QFrame.NoFrame)
         self._view.setAlignment(Qt.AlignCenter)
         self._view.setBackgroundBrush(Qt.black)
@@ -366,21 +477,18 @@ class ImageViewerWindow(QMainWindow):
         layout.addWidget(self._view)
         self.setCentralWidget(central)
 
-        self._zoom = 1.0
         self._load_image()
 
-        # Overlay buttons
         self._btn_delete = self._make_overlay_btn("🗑")
         self._btn_zoomin = self._make_overlay_btn("➕")
         self._btn_zoomout = self._make_overlay_btn("➖")
         self._btn_fit = self._make_overlay_btn("⤢")
 
         self._btn_delete.clicked.connect(self._delete_current)
-        self._btn_zoomin.clicked.connect(lambda: self._apply_zoom(1.25))
-        self._btn_zoomout.clicked.connect(lambda: self._apply_zoom(0.8))
+        self._btn_zoomin.clicked.connect(lambda: self._view.scale(1.25, 1.25))
+        self._btn_zoomout.clicked.connect(lambda: self._view.scale(0.8, 0.8))
         self._btn_fit.clicked.connect(self._fit)
 
-        # Fullscreen toggles
         self._act_fs = QAction("Fullscreen", self)
         self._act_fs.setShortcut("F11")
         self._act_fs.triggered.connect(self._toggle_fullscreen)
@@ -397,13 +505,6 @@ class ImageViewerWindow(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._place_buttons()
-
-    def wheelEvent(self, event):
-        delta = event.angleDelta().y()
-        if delta > 0:
-            self._apply_zoom(1.15)
-        elif delta < 0:
-            self._apply_zoom(0.87)
 
     def _make_overlay_btn(self, text: str) -> QToolButton:
         b = QToolButton(self)
@@ -427,13 +528,11 @@ class ImageViewerWindow(QMainWindow):
         return b
 
     def _place_buttons(self):
-        # bottom-right stack
         margin = 18
         size = 46
         gap = 10
         w = self.width()
         h = self.height()
-
         buttons = [self._btn_delete, self._btn_zoomin, self._btn_zoomout, self._btn_fit]
         for idx, b in enumerate(buttons):
             x = w - margin - size
@@ -447,13 +546,8 @@ class ImageViewerWindow(QMainWindow):
         self._fit()
 
     def _fit(self):
-        self._zoom = 1.0
         self._view.resetTransform()
         self._view.fitInView(self._pixmap_item, Qt.KeepAspectRatio)
-
-    def _apply_zoom(self, factor: float):
-        self._zoom *= factor
-        self._view.scale(factor, factor)
 
     def _delete_current(self):
         if not os.path.isfile(self._image_path):
@@ -484,7 +578,7 @@ class ImageViewerWindow(QMainWindow):
 
 
 # ----------------------------
-# Gallery window (tree + thumbnail grid)
+# Gallery window (unchanged)
 # ----------------------------
 class GalleryWindow(QMainWindow):
     def __init__(self, base_path: str, default_session_dir: str | None = None, parent=None):
@@ -493,10 +587,8 @@ class GalleryWindow(QMainWindow):
         self._base_path = base_path
         self._current_folder = default_session_dir or base_path
 
-        # left: folder tree
         self._fs_model = QFileSystemModel(self)
         self._fs_model.setRootPath(self._base_path)
-        self._fs_model.setFilter(Qt.MatchContains)  # harmless; we also set tree root
 
         self._tree = QTreeView()
         self._tree.setModel(self._fs_model)
@@ -505,13 +597,10 @@ class GalleryWindow(QMainWindow):
         self._tree.setAnimated(True)
         self._tree.setIndentation(14)
         self._tree.setSortingEnabled(True)
-
         for col in range(1, 4):
             self._tree.hideColumn(col)
-
         self._tree.clicked.connect(self._on_tree_clicked)
 
-        # right: thumbnails grid in scroll area
         self._thumb_container = QWidget()
         self._grid = QGridLayout(self._thumb_container)
         self._grid.setContentsMargins(14, 14, 14, 14)
@@ -528,11 +617,9 @@ class GalleryWindow(QMainWindow):
         splitter.addWidget(self._scroll)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 3)
-
         self.setCentralWidget(splitter)
         self.resize(1200, 700)
 
-        # load default folder
         self._select_default_folder()
         self._load_thumbnails(self._current_folder)
 
@@ -557,15 +644,9 @@ class GalleryWindow(QMainWindow):
 
     def _load_thumbnails(self, folder: str):
         self._clear_grid()
-        # Find images (previews)
         exts = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
         paths = []
         for root, _, files in os.walk(folder):
-            # only show one level deep if user selected a session dir
-            # but if user selects a block folder, it will show that folder too.
-            # We’ll stop descending too deep when starting from a session folder:
-            # If folder contains block_*, we want to show images from blocks too:
-            # So we allow recursion.
             for fn in sorted(files):
                 if fn.lower().endswith(exts):
                     paths.append(os.path.join(root, fn))
@@ -613,16 +694,14 @@ class GalleryWindow(QMainWindow):
             self._grid.addWidget(btn, r, c)
 
     def _open_viewer(self, path: str):
-        def on_deleted(deleted_path: str):
-            # refresh thumbnails after delete
+        def on_deleted(_deleted_path: str):
             self._load_thumbnails(self._current_folder)
-
         w = ImageViewerWindow(path, on_deleted_callback=on_deleted, parent=self)
         w.show()
 
 
 # ----------------------------
-# Main window (capture UI)
+# Main window (capture UI) with PREVIEW + CAMERA buttons
 # ----------------------------
 class MainWindow(QMainWindow):
     def __init__(self, config: dict):
@@ -631,10 +710,17 @@ class MainWindow(QMainWindow):
         self._config = config
         self._base_path = config["base_path"]
 
+        # Camera manager (mock for now)
+        self._cam_manager = MockCameraManager()
+
         self._session_dir = None
-        self._state = "READY"  # READY, RUNNING, PAUSED_BETWEEN_BLOCKS, STOPPED, DONE, ERROR
+        self._state = "READY"
         self._worker_thread = None
         self._worker = None
+
+        # Preview single-shot thread
+        self._preview_thread = None
+        self._preview_worker = None
 
         # Preview label
         self.preview = QLabel("Sin imagen aún")
@@ -642,7 +728,7 @@ class MainWindow(QMainWindow):
         self.preview.setStyleSheet("background: #000; color: rgba(255,255,255,140); font-size: 18px;")
         self.preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        # HUD overlay (simple label on top-left of preview)
+        # HUD overlay
         self.hud = QLabel("")
         self.hud.setStyleSheet("""
             QLabel {
@@ -659,7 +745,7 @@ class MainWindow(QMainWindow):
         self.hud.move(14, 14)
         self.hud.setText("READY")
 
-        # Right panel controls
+        # Right panel
         right = QWidget()
         right.setFixedWidth(360)
         right_layout = QVBoxLayout(right)
@@ -683,33 +769,27 @@ class MainWindow(QMainWindow):
         form.setFormAlignment(Qt.AlignTop)
         form.setVerticalSpacing(10)
 
-        # Exposure seconds
         self.exposure = QDoubleSpinBox()
         self.exposure.setRange(0.01, 3600.0)
         self.exposure.setValue(2.0)
         self.exposure.setDecimals(2)
         self.exposure.setSingleStep(0.5)
 
-        # Gain
         self.gain = QSpinBox()
         self.gain.setRange(0, 600)
         self.gain.setValue(120)
 
-        # Images per block
         self.images_per_block = QSpinBox()
         self.images_per_block.setRange(1, 10000)
         self.images_per_block.setValue(10)
 
-        # Blocks
         self.blocks = QSpinBox()
         self.blocks.setRange(1, 999)
         self.blocks.setValue(3)
 
-        # Session name
         self.session_name = QLineEdit()
         self.session_name.setPlaceholderText("Ej: M42_AskarV")
 
-        # Total label
         self.total_label = QLabel("0")
         self.total_label.setStyleSheet("color: rgba(255,255,255,200); font-weight: 600;")
 
@@ -734,9 +814,31 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(group)
 
         # Buttons
+        self.btn_camera = QPushButton("CÁMARA")
+        self.btn_preview = QPushButton("PREVIEW")
         self.btn_start = QPushButton("START")
         self.btn_stop = QPushButton("STOP")
         self.btn_gallery = QPushButton("GALERÍA")
+
+        # Styles
+        def style_neutral(btn: QPushButton):
+            btn.setStyleSheet("""
+                QPushButton {
+                    background: rgba(255,255,255,14);
+                    color: rgba(255,255,255,220);
+                    border: 1px solid rgba(255,255,255,50);
+                    border-radius: 12px;
+                    padding: 12px;
+                    font-size: 16px;
+                    font-weight: 700;
+                }
+                QPushButton:hover { background: rgba(255,255,255,22); }
+                QPushButton:disabled { background: rgba(255,255,255,8); color: rgba(255,255,255,120); }
+            """)
+
+        style_neutral(self.btn_camera)
+        style_neutral(self.btn_preview)
+        style_neutral(self.btn_gallery)
 
         self.btn_start.setStyleSheet("""
             QPushButton {
@@ -764,23 +866,16 @@ class MainWindow(QMainWindow):
             QPushButton:hover { background: #cc2a2a; }
             QPushButton:disabled { background: #5f2f2f; color: rgba(255,255,255,120); }
         """)
-        self.btn_gallery.setStyleSheet("""
-            QPushButton {
-                background: rgba(255,255,255,14);
-                color: rgba(255,255,255,220);
-                border: 1px solid rgba(255,255,255,50);
-                border-radius: 12px;
-                padding: 12px;
-                font-size: 16px;
-                font-weight: 700;
-            }
-            QPushButton:hover { background: rgba(255,255,255,22); }
-        """)
 
+        # Wiring
+        self.btn_camera.clicked.connect(self._open_camera_config)
+        self.btn_preview.clicked.connect(self._on_preview)
         self.btn_start.clicked.connect(self._on_start)
         self.btn_stop.clicked.connect(self._on_stop)
         self.btn_gallery.clicked.connect(self._open_gallery)
 
+        right_layout.addWidget(self.btn_camera)
+        right_layout.addWidget(self.btn_preview)
         right_layout.addWidget(self.btn_start)
         right_layout.addWidget(self.btn_stop)
         right_layout.addWidget(self.btn_gallery)
@@ -790,17 +885,14 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(hint)
         right_layout.addStretch(1)
 
-        # Split layout
         root = QWidget()
         root_layout = QHBoxLayout(root)
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.addWidget(self.preview, 1)
         root_layout.addWidget(right, 0)
-
         self.setCentralWidget(root)
         self.setStyleSheet("QMainWindow { background: #0b0b0b; }")
 
-        # Update total label automatically
         self.images_per_block.valueChanged.connect(self._update_total)
         self.blocks.valueChanged.connect(self._update_total)
         self._update_total()
@@ -816,25 +908,24 @@ class MainWindow(QMainWindow):
         self._act_esc.triggered.connect(self._exit_fullscreen)
         self.addAction(self._act_esc)
 
-        # Start fullscreen
         self.showFullScreen()
         self._apply_state_ui()
+        self._update_hud()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        # keep HUD in top-left of preview
         self.hud.move(14, 14)
+        # re-scale pixmap if exists
+        pm = self.preview.pixmap()
+        if pm and not pm.isNull():
+            scaled = pm.scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.preview.setPixmap(scaled)
 
     def _update_total(self):
-        total = self.images_per_block.value() * self.blocks.value()
-        self.total_label.setText(str(total))
+        self.total_label.setText(str(self.images_per_block.value() * self.blocks.value()))
 
     def _gather_params(self) -> CaptureParams:
-        session_name = self.session_name.text().strip()
-        if not session_name:
-            # auto name
-            session_name = "Sesion"
-
+        session_name = self.session_name.text().strip() or "Sesion"
         return CaptureParams(
             exposure_s=float(self.exposure.value()),
             gain=int(self.gain.value()),
@@ -844,33 +935,82 @@ class MainWindow(QMainWindow):
         )
 
     def _apply_state_ui(self):
-        if self._state in ("RUNNING",):
+        running = (self._state == "RUNNING")
+        paused = (self._state == "PAUSED_BETWEEN_BLOCKS")
+
+        self.btn_stop.setEnabled(running or paused)
+        if running:
             self.btn_start.setEnabled(False)
-            self.btn_stop.setEnabled(True)
-        elif self._state in ("PAUSED_BETWEEN_BLOCKS",):
+        elif paused:
             self.btn_start.setEnabled(True)
             self.btn_start.setText("START (Continuar)")
-            self.btn_stop.setEnabled(True)
-        elif self._state in ("READY", "DONE", "STOPPED", "ERROR"):
+        else:
             self.btn_start.setEnabled(True)
             self.btn_start.setText("START")
-            self.btn_stop.setEnabled(False)
+
+        # preview should be disabled only while running a capture session
+        self.btn_preview.setEnabled(not running)
+
+    def _open_camera_config(self):
+        dlg = CameraConfigDialog(self._cam_manager, parent=self)
+        dlg.exec()
+        self._update_hud()
+
+    def _on_preview(self):
+        if self._state == "RUNNING":
+            return
+
+        # avoid multiple preview threads
+        if self._preview_thread and self._preview_thread.isRunning():
+            return
+
+        exposure_s = float(self.exposure.value())
+        gain = int(self.gain.value())
+
+        self._update_hud(extra="PREVIEW: capturando...")
+
+        self._preview_thread = QThread(self)
+        self._preview_worker = PreviewWorker(self._cam_manager, exposure_s, gain)
+        self._preview_worker.moveToThread(self._preview_thread)
+
+        self._preview_thread.started.connect(self._preview_worker.run)
+        self._preview_worker.preview_ready.connect(self._on_preview_ready)
+        self._preview_worker.error.connect(self._on_error)
+        self._preview_worker.finished.connect(self._on_preview_finished)
+
+        self._preview_thread.start()
+
+    def _on_preview_ready(self, qimg: QImage, exposure_s: float, gain: int, cam_name: str):
+        pm = QPixmap.fromImage(qimg)
+        scaled = pm.scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.preview.setPixmap(scaled)
+        self.hud.setText(
+            f"STATE: {self._state}\n"
+            f"CAM: {cam_name}\n"
+            f"PREVIEW\n"
+            f"EXP: {exposure_s:.2f}s  GAIN: {gain}"
+        )
+
+    def _on_preview_finished(self):
+        if self._preview_thread:
+            self._preview_thread.quit()
+            self._preview_thread.wait(1000)
+        self._preview_thread = None
+        self._preview_worker = None
+        self._update_hud()
 
     def _on_start(self):
-        # If paused between blocks, just resume
         if self._state == "PAUSED_BETWEEN_BLOCKS" and self._worker:
             self._worker.request_resume()
             return
 
-        # Otherwise start a new session
         if self._worker_thread and self._worker_thread.isRunning():
             return
 
         params = self._gather_params()
 
-        # Thread + worker
         self._worker_thread = QThread(self)
-        self._worker = CaptureWorker(base_path=self._base_path)
+        self._worker = CaptureWorker(base_path=self._base_path, cam_manager=self._cam_manager)
         self._worker.moveToThread(self._worker_thread)
 
         self._worker_thread.started.connect(lambda: self._worker.run_session(params))
@@ -887,7 +1027,7 @@ class MainWindow(QMainWindow):
 
     def _on_session_created(self, session_dir: str):
         self._session_dir = session_dir
-        self._update_hud(extra=f"SESSION: {os.path.basename(session_dir)}")
+        self._update_hud()
 
     def _on_error(self, msg: str):
         QMessageBox.critical(self, "Error", msg)
@@ -897,7 +1037,6 @@ class MainWindow(QMainWindow):
         self._apply_state_ui()
         self._update_hud()
 
-        # If finished/stopped, clean up thread
         if st in ("DONE", "STOPPED", "ERROR"):
             if self._worker_thread:
                 self._worker_thread.quit()
@@ -906,33 +1045,32 @@ class MainWindow(QMainWindow):
             self._worker = None
 
     def _update_hud(self, extra: str = ""):
-        lines = [f"STATE: {self._state}"]
+        cam_name = self._cam_manager.connected_name()
+        lines = [f"STATE: {self._state}", f"CAM: {cam_name}"]
         if self._session_dir:
             lines.append(f"SESSION: {os.path.basename(self._session_dir)}")
-        if extra and extra not in lines:
+        if extra:
             lines.append(extra)
         self.hud.setText("\n".join(lines))
 
     def _on_frame_ready(self, qimg: QImage, saved_path: str,
                        block_idx: int, blocks_total: int,
                        idx_in_block: int, imgs_per_block: int,
-                       global_idx: int, exposure_s: float, gain: int):
-        # Update preview pixmap
+                       global_idx: int, exposure_s: float, gain: int, cam_name: str):
         pm = QPixmap.fromImage(qimg)
         scaled = pm.scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.preview.setPixmap(scaled)
 
-        # Update HUD details
         session_name = os.path.basename(self._session_dir) if self._session_dir else "-"
-        text = (
+        self.hud.setText(
             f"STATE: {self._state}\n"
+            f"CAM: {cam_name}\n"
             f"SESSION: {session_name}\n"
             f"BLOCK: {block_idx}/{blocks_total}\n"
             f"IMG: {idx_in_block}/{imgs_per_block} (global {global_idx})\n"
             f"EXP: {exposure_s:.2f}s  GAIN: {gain}\n"
             f"SAVED: {os.path.basename(saved_path)}"
         )
-        self.hud.setText(text)
 
     def _open_gallery(self):
         default_dir = self._session_dir if self._session_dir else self._base_path
