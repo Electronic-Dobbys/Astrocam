@@ -1,36 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Astro Capture App (Demo) - PySide6
-
-NUEVO:
-- Botón PREVIEW (una captura usando exposición/ganancia actuales, sin guardar)
-- Botón CÁMARA (config / conectar / desconectar / seleccionar si hay más de una)
-
-Este demo sigue usando MockCamera, pero la arquitectura deja listo el paso a ZWO real.
-
-Requirements:
-  pip install PySide6 numpy
-Run:
-  python3 astro_capture_app.py
-"""
 
 import os
 import sys
 import json
 import time
-import random
 import pathlib
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Optional, Tuple, List
 
 import numpy as np
+from PIL import Image
 
 from PySide6.QtCore import (
     Qt, QSize, QRect, QThread, Signal, QObject, QMutex, QWaitCondition
 )
 from PySide6.QtGui import (
-    QImage, QPixmap, QAction, QIcon
+    QImage, QPixmap, QAction, QIcon, QPainter, QPen, QColor
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
@@ -38,11 +25,10 @@ from PySide6.QtWidgets import (
     QGroupBox, QMessageBox, QFileSystemModel, QTreeView, QScrollArea,
     QGridLayout, QFrame, QToolButton, QGraphicsView, QGraphicsScene,
     QGraphicsPixmapItem, QSizePolicy, QSplitter,
-    QDialog, QDialogButtonBox, QComboBox
+    QDialog, QDialogButtonBox, QComboBox, QSlider
 )
 
-
-APP_NAME = "Astro Capture App (Demo)"
+APP_NAME = "Astro Capture App (ZWO Real)"
 CONFIG_FILENAME = "config.json"
 
 
@@ -50,21 +36,16 @@ CONFIG_FILENAME = "config.json"
 # Config
 # ----------------------------
 def load_or_create_config() -> dict:
-    """
-    Config lives next to the script.
-    If not found, creates one pointing to ~/AstroCaptures
-    """
     script_dir = pathlib.Path(__file__).resolve().parent
     cfg_path = script_dir / CONFIG_FILENAME
 
+    cfg = {}
     if cfg_path.exists():
         try:
             with open(cfg_path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
         except Exception:
             cfg = {}
-    else:
-        cfg = {}
 
     if "base_path" not in cfg:
         cfg["base_path"] = str(pathlib.Path.home() / "AstroCaptures")
@@ -91,103 +72,217 @@ class CaptureParams:
 
 
 # ----------------------------
-# Mock camera (synthetic stars)
+# ZWO camera manager (REAL)
 # ----------------------------
-class MockCamera:
+class ZwoCameraManager:
     """
-    Produces a 16-bit grayscale synthetic "star field" image.
-    Uses exposure_s & gain to modulate brightness/noise.
-    """
-    def __init__(self, width=1280, height=720, name="MockCam"):
-        self.width = int(width)
-        self.height = int(height)
-        self.name = name
-
-    def capture_frame_u16(self, exposure_s: float, gain: int) -> np.ndarray:
-        time.sleep(min(max(exposure_s, 0.05), 0.8))
-        h, w = self.height, self.width
-        img = np.zeros((h, w), dtype=np.float32)
-
-        yy, xx = np.mgrid[0:h, 0:w]
-        cx, cy = w / 2.0, h / 2.0
-        r = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2) / (0.9 * max(w, h))
-        vignette = np.clip(1.0 - 0.7 * r, 0.4, 1.0)
-        base = 300 + 80 * vignette
-        img += base
-
-        n_stars = 180 + int(0.7 * gain)
-        for _ in range(n_stars):
-            x0 = random.uniform(0, w - 1)
-            y0 = random.uniform(0, h - 1)
-            amp = random.uniform(800, 4000) * (0.6 + 0.01 * gain) * (0.4 + exposure_s)
-            sigma = random.uniform(0.7, 2.2)
-            dx = xx - x0
-            dy = yy - y0
-            img += amp * np.exp(-(dx * dx + dy * dy) / (2 * sigma * sigma))
-
-        read_noise = 25 + (gain * 0.3)
-        shot_scale = 0.02 + 0.005 * exposure_s
-        noise = np.random.normal(0, read_noise, size=(h, w)).astype(np.float32)
-        img = img + noise + shot_scale * np.sqrt(np.clip(img, 0, None)) * np.random.normal(0, 1, (h, w)).astype(np.float32)
-
-        img = np.clip(img, 0, 65535).astype(np.uint16)
-        return img
-
-
-# ----------------------------
-# Camera manager abstraction (Mock version)
-# ----------------------------
-class MockCameraManager:
-    """
-    Simula múltiples cámaras conectadas.
-    Esto se reemplaza luego por ZWO (list / connect / disconnect).
+    Real ZWO manager using zwoasi + ASICamera2 SDK.
+    - lists connected cameras
+    - connect/disconnect
+    - capture RAW16 and produce preview (grayscale stretch for now)
     """
     def __init__(self):
-        self._devices = [
-            MockCamera(1600, 900, "MockCam ASI294MC"),
-            MockCamera(1280, 720, "MockCam ASI462MC"),
-            MockCamera(1920, 1080, "MockCam ASI2600MM Pro"),
-        ]
-        self._connected_index = None
+        self._asi = None
+        self._connected_index: Optional[int] = None
+        self._cam = None
+        self._cam_props = None
+        self._lib_ok = False
+        self._last_list: List[str] = []
 
-    def list_cameras(self):
-        return [cam.name for cam in self._devices]
+        self._init_asi()
+
+    def _find_asi_lib(self) -> Optional[str]:
+        # You can also export ASI_SDK_LIB=/path/to/libASICamera2.so
+        env = os.environ.get("ASI_SDK_LIB", "").strip()
+        if env and os.path.isfile(env):
+            return env
+
+        candidates = [
+            "/usr/local/lib/libASICamera2.so",
+            "/usr/lib/libASICamera2.so",
+            "/usr/lib/aarch64-linux-gnu/libASICamera2.so",
+            "/usr/lib/arm-linux-gnueabihf/libASICamera2.so",
+            "/lib/aarch64-linux-gnu/libASICamera2.so",
+            "/lib/arm-linux-gnueabihf/libASICamera2.so",
+        ]
+        for p in candidates:
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def _init_asi(self):
+        try:
+            import zwoasi as asi  # type: ignore
+            lib = self._find_asi_lib()
+            if not lib:
+                self._asi = asi
+                self._lib_ok = False
+                return
+            asi.init(lib)
+            self._asi = asi
+            self._lib_ok = True
+        except Exception:
+            self._asi = None
+            self._lib_ok = False
+
+    def is_available(self) -> Tuple[bool, str]:
+        if self._asi is None:
+            return False, "No se pudo importar zwoasi. Instala: pip install zwoasi"
+        if not self._lib_ok:
+            return False, "No se encontró libASICamera2.so. Define ASI_SDK_LIB o instala el SDK ASICamera2."
+        return True, "OK"
+
+    def list_cameras(self) -> List[str]:
+        ok, _ = self.is_available()
+        if not ok:
+            self._last_list = []
+            return []
+
+        names = self._asi.list_cameras()
+        # list_cameras() devuelve nombres, el número de cámaras conectadas.
+        self._last_list = list(names)
+        return self._last_list
 
     def is_connected(self) -> bool:
-        return self._connected_index is not None
+        return self._cam is not None and self._connected_index is not None
 
     def connected_name(self) -> str:
-        if self._connected_index is None:
+        if not self.is_connected():
             return "Ninguna"
-        return self._devices[self._connected_index].name
+        try:
+            return self._cam_props.get("Name", f"Camera #{self._connected_index}")  # zwoasi returns dict-like
+        except Exception:
+            return f"Camera #{self._connected_index}"
 
     def connect(self, index: int):
-        if index < 0 or index >= len(self._devices):
+        ok, msg = self.is_available()
+        if not ok:
+            raise RuntimeError(msg)
+
+        names = self.list_cameras()
+        if index < 0 or index >= len(names):
             raise ValueError("Índice de cámara inválido.")
+
+        # close any existing
+        self.disconnect()
+
+        cam = self._asi.Camera(index)
+        cam.open()
+        cam.init_camera()
+        props = cam.get_camera_property()
+
+        # Set defaults: RAW16 full frame
+        try:
+            cam.set_image_type(self._asi.ASI_IMG_RAW16)
+        except Exception:
+            pass
+
+        self._cam = cam
+        self._cam_props = props
         self._connected_index = index
 
     def disconnect(self):
+        try:
+            if self._cam is not None:
+                self._cam.close()
+        except Exception:
+            pass
+        self._cam = None
+        self._cam_props = None
         self._connected_index = None
 
-    def get_active_camera(self) -> MockCamera:
-        # si no hay conectada, conectamos por defecto la primera (para demo)
-        if self._connected_index is None:
-            self._connected_index = 0
-        return self._devices[self._connected_index]
+    def _ensure_connected(self):
+        if not self.is_connected():
+            raise RuntimeError("No hay cámara conectada. Abre CÁMARA y conecta una.")
+
+    def get_controls_info(self) -> dict:
+        self._ensure_connected()
+        return self._cam.get_controls()
+
+    def capture_raw16(self, exposure_s: float, gain: int) -> Tuple[np.ndarray, dict]:
+        """
+        Returns (image array, meta). For color cameras this is Bayer RAW16.
+        For preview we will treat it as grayscale.
+        """
+        self._ensure_connected()
+
+        asi = self._asi
+        cam = self._cam
+
+        # Exposure in microseconds
+        cam.set_control_value(asi.ASI_EXPOSURE, int(exposure_s * 1_000_000))
+        cam.set_control_value(asi.ASI_GAIN, int(gain))
+
+        # Ensure RAW16
+        try:
+            cam.set_image_type(asi.ASI_IMG_RAW16)
+        except Exception:
+            pass
+
+        # Start single exposure
+        cam.start_exposure(False)
+
+        # Poll status
+        while True:
+            st = cam.get_exposure_status()
+            if st == asi.ASI_EXP_WORKING:
+                time.sleep(0.01)
+                continue
+            if st != asi.ASI_EXP_SUCCESS:
+                raise RuntimeError(f"Exposure failed, status={st}")
+            break
+
+        data = cam.get_data_after_exposure()
+        width, height, binning, image_type = cam.get_roi()
+
+        # RAW16 -> uint16
+        arr = np.frombuffer(data, dtype=np.uint16)
+        if arr.size != width * height:
+            # Some cameras may return padded data depending on ROI; best effort:
+            arr = arr[:width * height]
+        img = arr.reshape((height, width))
+
+        meta = {
+            "width": width,
+            "height": height,
+            "bin": binning,
+            "image_type": image_type,
+            "camera_name": self.connected_name(),
+            "exposure_s": exposure_s,
+            "gain": gain,
+        }
+        return img, meta
 
 
 # ----------------------------
 # Image utilities
 # ----------------------------
-def stretch_u16_to_u8(img_u16: np.ndarray, lo_pct=1.0, hi_pct=99.7, gamma=0.9) -> np.ndarray:
+def stretch_u16_to_u8(img_u16: np.ndarray, black: int, white: int, gamma: float) -> np.ndarray:
+    """
+    Simple stretch:
+      - clip to [black, white]
+      - normalize to 0..1
+      - apply gamma
+      - output uint8
+    """
     a = img_u16.astype(np.float32)
-    lo = np.percentile(a, lo_pct)
-    hi = np.percentile(a, hi_pct)
-    if hi <= lo + 1e-6:
-        hi = lo + 1.0
-    a = (a - lo) / (hi - lo)
+    b = float(max(0, min(black, 65535)))
+    w = float(max(b + 1, min(white, 65535)))
+    a = (a - b) / (w - b)
     a = np.clip(a, 0.0, 1.0)
-    a = np.power(a, gamma)
+    g = max(0.05, min(gamma, 5.0))
+    a = np.power(a, 1.0 / g)
+    return (a * 255.0).astype(np.uint8)
+
+
+def stretch_u8(img_u8: np.ndarray, black: int, white: int, gamma: float) -> np.ndarray:
+    a = img_u8.astype(np.float32)
+    b = float(max(0, min(black, 255)))
+    w = float(max(b + 1, min(white, 255)))
+    a = (a - b) / (w - b)
+    a = np.clip(a, 0.0, 1.0)
+    g = max(0.05, min(gamma, 5.0))
+    a = np.power(a, 1.0 / g)
     return (a * 255.0).astype(np.uint8)
 
 
@@ -196,6 +291,10 @@ def gray_u8_to_qimage(gray_u8: np.ndarray) -> QImage:
     gray_u8_c = np.ascontiguousarray(gray_u8)
     qimg = QImage(gray_u8_c.data, w, h, w, QImage.Format_Grayscale8)
     return qimg.copy()
+
+
+def save_png_gray(gray_u8: np.ndarray, path: str):
+    Image.fromarray(gray_u8, mode="L").save(path)
 
 
 # ----------------------------
@@ -207,9 +306,7 @@ class SessionManager:
 
     def create_session_dir(self, session_name: str) -> str:
         safe = "".join(c for c in session_name.strip() if c.isalnum() or c in ("-", "_", " "))
-        safe = safe.strip().replace(" ", "_")
-        if not safe:
-            safe = "Sesion"
+        safe = safe.strip().replace(" ", "_") or "Sesion"
         stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         folder = f"{safe}_{stamp}"
         path = os.path.join(self.base_path, folder)
@@ -239,14 +336,79 @@ class SessionManager:
 
 
 # ----------------------------
-# Worker for a single preview shot (thread)
+# Histogram widget
+# ----------------------------
+class HistogramWidget(QWidget):
+    """
+    Displays histogram of a uint8 grayscale image.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._hist = np.zeros(256, dtype=np.int64)
+        self._black = 0
+        self._white = 255
+
+        self.setMinimumHeight(120)
+        self.setStyleSheet("background: #111; border: 1px solid rgba(255,255,255,40); border-radius: 10px;")
+
+    def set_histogram(self, img_u8: np.ndarray, black: int, white: int):
+        if img_u8 is None or img_u8.size == 0:
+            self._hist = np.zeros(256, dtype=np.int64)
+        else:
+            h, _ = np.histogram(img_u8.flatten(), bins=256, range=(0, 255))
+            self._hist = h.astype(np.int64)
+        self._black = int(black)
+        self._white = int(white)
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+
+        rect = self.rect().adjusted(10, 10, -10, -10)
+        w = rect.width()
+        h = rect.height()
+
+        if self._hist.max() <= 0:
+            painter.end()
+            return
+
+        # Normalize
+        hist = self._hist.astype(np.float32)
+        hist = hist / hist.max()
+
+        # Draw bars
+        pen = QPen(QColor(220, 220, 220, 180))
+        painter.setPen(pen)
+
+        for x in range(256):
+            vx = rect.left() + int((x / 255.0) * w)
+            bar_h = int(hist[x] * h)
+            painter.drawLine(vx, rect.bottom(), vx, rect.bottom() - bar_h)
+
+        # Draw black/white markers
+        marker_pen = QPen(QColor(80, 200, 255, 220))
+        marker_pen.setWidth(2)
+        painter.setPen(marker_pen)
+
+        bx = rect.left() + int((self._black / 255.0) * w)
+        wx = rect.left() + int((self._white / 255.0) * w)
+        painter.drawLine(bx, rect.top(), bx, rect.bottom())
+        painter.drawLine(wx, rect.top(), wx, rect.bottom())
+
+        painter.end()
+
+
+# ----------------------------
+# Workers
 # ----------------------------
 class PreviewWorker(QObject):
     preview_ready = Signal(QImage, float, int, str)  # qimg, exposure, gain, camera_name
     error = Signal(str)
     finished = Signal()
 
-    def __init__(self, cam_manager: MockCameraManager, exposure_s: float, gain: int):
+    def __init__(self, cam_manager: ZwoCameraManager, exposure_s: float, gain: int):
         super().__init__()
         self._cam_manager = cam_manager
         self._exposure_s = exposure_s
@@ -254,28 +416,27 @@ class PreviewWorker(QObject):
 
     def run(self):
         try:
-            cam = self._cam_manager.get_active_camera()
-            img_u16 = cam.capture_frame_u16(self._exposure_s, self._gain)
-            gray_u8 = stretch_u16_to_u8(img_u16)
-            qimg = gray_u8_to_qimage(gray_u8)
-            self.preview_ready.emit(qimg, self._exposure_s, self._gain, cam.name)
+            img_u16, meta = self._cam_manager.capture_raw16(self._exposure_s, self._gain)
+            # default stretch for preview
+            # simple auto black/white from percentiles:
+            lo = int(np.percentile(img_u16, 1.0))
+            hi = int(np.percentile(img_u16, 99.7))
+            u8 = stretch_u16_to_u8(img_u16, lo, hi, gamma=1.0)
+            qimg = gray_u8_to_qimage(u8)
+            self.preview_ready.emit(qimg, self._exposure_s, self._gain, meta["camera_name"])
         except Exception as e:
             self.error.emit(str(e))
         finally:
             self.finished.emit()
 
 
-# ----------------------------
-# Capture worker (runs in thread) - uses camera manager
-# ----------------------------
 class CaptureWorker(QObject):
     frame_ready = Signal(QImage, str, int, int, int, int, int, float, int, str)
-    # qimg, saved_path, block_idx, blocks_total, idx_in_block, imgs_per_block, global_idx, exposure_s, gain, camera_name
     state_changed = Signal(str)
     error = Signal(str)
     session_created = Signal(str)
 
-    def __init__(self, base_path: str, cam_manager: MockCameraManager):
+    def __init__(self, base_path: str, cam_manager: ZwoCameraManager):
         super().__init__()
         self._base_path = base_path
         self._cam_manager = cam_manager
@@ -283,7 +444,6 @@ class CaptureWorker(QObject):
         self._cond = QWaitCondition()
         self._stop = False
         self._pause_waiting = False
-
         self._session_mgr = SessionManager(base_path)
 
     def request_stop(self):
@@ -306,14 +466,15 @@ class CaptureWorker(QObject):
             self._stop = False
             self._mutex.unlock()
 
-            cam = self._cam_manager.get_active_camera()
-            cam_name = cam.name
+            if not self._cam_manager.is_connected():
+                raise RuntimeError("No hay cámara conectada. Abre CÁMARA y conecta una.")
 
             session_dir = self._session_mgr.create_session_dir(params.session_name)
             self._session_mgr.save_session_config(session_dir, params)
             self.session_created.emit(session_dir)
 
             global_idx = 0
+            cam_name = self._cam_manager.connected_name()
 
             for b in range(1, params.blocks + 1):
                 if self._should_stop():
@@ -328,13 +489,17 @@ class CaptureWorker(QObject):
                         self.state_changed.emit("STOPPED")
                         return
 
-                    img_u16 = cam.capture_frame_u16(params.exposure_s, params.gain)
-                    gray_u8 = stretch_u16_to_u8(img_u16)
-                    qimg = gray_u8_to_qimage(gray_u8)
+                    img_u16, meta = self._cam_manager.capture_raw16(params.exposure_s, params.gain)
+
+                    # For saving preview PNG: auto stretch each frame for usability
+                    lo = int(np.percentile(img_u16, 1.0))
+                    hi = int(np.percentile(img_u16, 99.7))
+                    u8 = stretch_u16_to_u8(img_u16, lo, hi, gamma=1.0)
+                    qimg = gray_u8_to_qimage(u8)
 
                     global_idx += 1
                     out_path = self._session_mgr.make_preview_filename(block_dir, global_idx, "png")
-                    qimg.save(out_path, "PNG")
+                    save_png_gray(u8, out_path)
 
                     self.frame_ready.emit(
                         qimg, out_path,
@@ -343,6 +508,7 @@ class CaptureWorker(QObject):
                         global_idx, params.exposure_s, params.gain, cam_name
                     )
 
+                # pause between blocks
                 if b < params.blocks:
                     self.state_changed.emit("PAUSED_BETWEEN_BLOCKS")
                     self._wait_for_resume_or_stop()
@@ -374,9 +540,9 @@ class CaptureWorker(QObject):
 # Camera config dialog
 # ----------------------------
 class CameraConfigDialog(QDialog):
-    def __init__(self, cam_manager: MockCameraManager, parent=None):
+    def __init__(self, cam_manager: ZwoCameraManager, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Configuración de cámara")
+        self.setWindowTitle("Configuración de cámara (ZWO)")
         self.setModal(True)
         self._cam_manager = cam_manager
 
@@ -385,6 +551,10 @@ class CameraConfigDialog(QDialog):
         self.lbl_status = QLabel("")
         self.lbl_status.setStyleSheet("color: rgba(255,255,255,220); font-size: 14px;")
         layout.addWidget(self.lbl_status)
+
+        self.lbl_info = QLabel("")
+        self.lbl_info.setStyleSheet("color: rgba(255,255,255,160); font-size: 12px;")
+        layout.addWidget(self.lbl_info)
 
         self.combo = QComboBox()
         self.combo.setStyleSheet("""
@@ -399,10 +569,11 @@ class CameraConfigDialog(QDialog):
         layout.addWidget(self.combo)
 
         btn_row = QHBoxLayout()
+        self.btn_refresh = QPushButton("Refrescar USB")
         self.btn_connect = QPushButton("Conectar")
         self.btn_disconnect = QPushButton("Desconectar")
 
-        for b in [self.btn_connect, self.btn_disconnect]:
+        for b in [self.btn_refresh, self.btn_connect, self.btn_disconnect]:
             b.setStyleSheet("""
                 QPushButton {
                     background: rgba(255,255,255,14);
@@ -415,6 +586,7 @@ class CameraConfigDialog(QDialog):
                 }
                 QPushButton:hover { background: rgba(255,255,255,22); }
             """)
+        btn_row.addWidget(self.btn_refresh)
         btn_row.addWidget(self.btn_connect)
         btn_row.addWidget(self.btn_disconnect)
         layout.addLayout(btn_row)
@@ -425,15 +597,24 @@ class CameraConfigDialog(QDialog):
 
         self.setStyleSheet("QDialog { background: #0b0b0b; }")
 
+        self.btn_refresh.clicked.connect(self._reload)
         self.btn_connect.clicked.connect(self._connect_selected)
         self.btn_disconnect.clicked.connect(self._disconnect)
 
         self._reload()
 
     def _reload(self):
-        cams = self._cam_manager.list_cameras()
+        ok, msg = self._cam_manager.is_available()
+        self.lbl_info.setText(msg)
         self.combo.clear()
-        self.combo.addItems(cams)
+        if not ok:
+            self._update_status()
+            return
+        cams = self._cam_manager.list_cameras()
+        if not cams:
+            self.combo.addItem("(No se detectan cámaras ZWO)")
+        else:
+            self.combo.addItems(cams)
         self._update_status()
 
     def _update_status(self):
@@ -441,6 +622,11 @@ class CameraConfigDialog(QDialog):
 
     def _connect_selected(self):
         try:
+            ok, msg = self._cam_manager.is_available()
+            if not ok:
+                raise RuntimeError(msg)
+            if self.combo.currentText().startswith("("):
+                raise RuntimeError("No hay cámara para conectar.")
             idx = self.combo.currentIndex()
             self._cam_manager.connect(idx)
             self._update_status()
@@ -453,7 +639,7 @@ class CameraConfigDialog(QDialog):
 
 
 # ----------------------------
-# Viewer window (unchanged)
+# Image viewer with histogram + stretch
 # ----------------------------
 class ImageViewerWindow(QMainWindow):
     def __init__(self, image_path: str, on_deleted_callback=None, parent=None):
@@ -471,23 +657,82 @@ class ImageViewerWindow(QMainWindow):
         self._pixmap_item = QGraphicsPixmapItem()
         self._scene.addItem(self._pixmap_item)
 
-        central = QWidget()
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self._view)
-        self.setCentralWidget(central)
+        self._hist = HistogramWidget()
 
-        self._load_image()
+        # sliders
+        self._slider_black = QSlider(Qt.Horizontal)
+        self._slider_white = QSlider(Qt.Horizontal)
+        self._slider_gamma = QSlider(Qt.Horizontal)
 
+        for s in (self._slider_black, self._slider_white):
+            s.setRange(0, 255)
+        self._slider_black.setValue(0)
+        self._slider_white.setValue(255)
+
+        # gamma slider: map 10..300 -> 0.10..3.00
+        self._slider_gamma.setRange(10, 300)
+        self._slider_gamma.setValue(100)  # 1.00
+
+        def style_slider(sl: QSlider):
+            sl.setStyleSheet("""
+                QSlider::groove:horizontal { height: 6px; background: rgba(255,255,255,40); border-radius: 3px; }
+                QSlider::handle:horizontal { width: 14px; background: rgba(255,255,255,200); margin: -6px 0; border-radius: 7px; }
+            """)
+        style_slider(self._slider_black)
+        style_slider(self._slider_white)
+        style_slider(self._slider_gamma)
+
+        self._lbl_black = QLabel("Black: 0")
+        self._lbl_white = QLabel("White: 255")
+        self._lbl_gamma = QLabel("Gamma: 1.00")
+        for lb in (self._lbl_black, self._lbl_white, self._lbl_gamma):
+            lb.setStyleSheet("color: rgba(255,255,255,180); font-size: 12px;")
+
+        panel = QWidget()
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(14, 14, 14, 14)
+        panel_layout.setSpacing(10)
+
+        panel_layout.addWidget(self._hist)
+
+        panel_layout.addWidget(self._lbl_black)
+        panel_layout.addWidget(self._slider_black)
+
+        panel_layout.addWidget(self._lbl_white)
+        panel_layout.addWidget(self._slider_white)
+
+        panel_layout.addWidget(self._lbl_gamma)
+        panel_layout.addWidget(self._slider_gamma)
+
+        panel.setFixedWidth(320)
+        panel.setStyleSheet("background: rgba(0,0,0,160); border-left: 1px solid rgba(255,255,255,40);")
+
+        root = QWidget()
+        root_layout = QHBoxLayout(root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.addWidget(self._view, 1)
+        root_layout.addWidget(panel, 0)
+        self.setCentralWidget(root)
+
+        self._img_u8_orig = None  # original loaded image as uint8 (grayscale)
+        self._img_u8_disp = None  # stretched
+
+        self._slider_black.valueChanged.connect(self._on_stretch_changed)
+        self._slider_white.valueChanged.connect(self._on_stretch_changed)
+        self._slider_gamma.valueChanged.connect(self._on_stretch_changed)
+
+        # Overlay buttons
         self._btn_delete = self._make_overlay_btn("🗑")
         self._btn_zoomin = self._make_overlay_btn("➕")
         self._btn_zoomout = self._make_overlay_btn("➖")
         self._btn_fit = self._make_overlay_btn("⤢")
+        self._btn_close = self._make_overlay_btn("✕")
 
         self._btn_delete.clicked.connect(self._delete_current)
         self._btn_zoomin.clicked.connect(lambda: self._view.scale(1.25, 1.25))
         self._btn_zoomout.clicked.connect(lambda: self._view.scale(0.8, 0.8))
         self._btn_fit.clicked.connect(self._fit)
+        self._btn_close.clicked.connect(self.close)
 
         self._act_fs = QAction("Fullscreen", self)
         self._act_fs.setShortcut("F11")
@@ -499,12 +744,20 @@ class ImageViewerWindow(QMainWindow):
         self._act_esc.triggered.connect(self._exit_fullscreen)
         self.addAction(self._act_esc)
 
+        self._load_image()
         self.showFullScreen()
         self._place_buttons()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._place_buttons()
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if delta > 0:
+            self._view.scale(1.15, 1.15)
+        elif delta < 0:
+            self._view.scale(0.87, 0.87)
 
     def _make_overlay_btn(self, text: str) -> QToolButton:
         b = QToolButton(self)
@@ -533,17 +786,62 @@ class ImageViewerWindow(QMainWindow):
         gap = 10
         w = self.width()
         h = self.height()
-        buttons = [self._btn_delete, self._btn_zoomin, self._btn_zoomout, self._btn_fit]
+        buttons = [self._btn_delete, self._btn_zoomin, self._btn_zoomout, self._btn_fit, self._btn_close]
         for idx, b in enumerate(buttons):
-            x = w - margin - size
+            x = w - margin - size - 320  # account for histogram panel
             y = h - margin - size - idx * (size + gap)
             b.setGeometry(QRect(x, y, size, size))
 
     def _load_image(self):
-        pm = QPixmap(self._image_path)
+        # Load PNG/JPG etc. Convert to grayscale uint8
+        if not os.path.isfile(self._image_path):
+            raise RuntimeError("Imagen no existe.")
+        im = Image.open(self._image_path).convert("L")
+        arr = np.array(im, dtype=np.uint8)
+        self._img_u8_orig = arr
+
+        # auto initial stretch: percentiles
+        lo = int(np.percentile(arr, 1.0))
+        hi = int(np.percentile(arr, 99.7))
+        self._slider_black.setValue(lo)
+        self._slider_white.setValue(max(lo + 1, hi))
+        self._slider_gamma.setValue(100)
+
+        self._apply_stretch_and_render()
+
+    def _on_stretch_changed(self):
+        if self._img_u8_orig is None:
+            return
+        b = int(self._slider_black.value())
+        w = int(self._slider_white.value())
+        if w <= b:
+            w = b + 1
+            self._slider_white.blockSignals(True)
+            self._slider_white.setValue(w)
+            self._slider_white.blockSignals(False)
+
+        g = float(self._slider_gamma.value()) / 100.0
+        self._lbl_black.setText(f"Black: {b}")
+        self._lbl_white.setText(f"White: {w}")
+        self._lbl_gamma.setText(f"Gamma: {g:.2f}")
+
+        self._apply_stretch_and_render()
+
+    def _apply_stretch_and_render(self):
+        b = int(self._slider_black.value())
+        w = int(self._slider_white.value())
+        g = float(self._slider_gamma.value()) / 100.0
+
+        disp = stretch_u8(self._img_u8_orig, b, w, g)
+        self._img_u8_disp = disp
+
+        qimg = gray_u8_to_qimage(disp)
+        pm = QPixmap.fromImage(qimg)
         self._pixmap_item.setPixmap(pm)
         self._scene.setSceneRect(pm.rect())
         self._fit()
+
+        self._hist.set_histogram(self._img_u8_orig, b, w)
 
     def _fit(self):
         self._view.resetTransform()
@@ -578,7 +876,7 @@ class ImageViewerWindow(QMainWindow):
 
 
 # ----------------------------
-# Gallery window (unchanged)
+# Gallery window (functional thumbnails)
 # ----------------------------
 class GalleryWindow(QMainWindow):
     def __init__(self, base_path: str, default_session_dir: str | None = None, parent=None):
@@ -701,7 +999,7 @@ class GalleryWindow(QMainWindow):
 
 
 # ----------------------------
-# Main window (capture UI) with PREVIEW + CAMERA buttons
+# Main window
 # ----------------------------
 class MainWindow(QMainWindow):
     def __init__(self, config: dict):
@@ -710,15 +1008,13 @@ class MainWindow(QMainWindow):
         self._config = config
         self._base_path = config["base_path"]
 
-        # Camera manager (mock for now)
-        self._cam_manager = MockCameraManager()
+        self._cam_manager = ZwoCameraManager()
 
         self._session_dir = None
-        self._state = "READY"
+        self._state = "READY"  # READY, RUNNING, PAUSED_BETWEEN_BLOCKS, STOPPED, DONE, ERROR
         self._worker_thread = None
         self._worker = None
 
-        # Preview single-shot thread
         self._preview_thread = None
         self._preview_worker = None
 
@@ -743,7 +1039,6 @@ class MainWindow(QMainWindow):
         """)
         self.hud.setParent(self.preview)
         self.hud.move(14, 14)
-        self.hud.setText("READY")
 
         # Right panel
         right = QWidget()
@@ -776,7 +1071,7 @@ class MainWindow(QMainWindow):
         self.exposure.setSingleStep(0.5)
 
         self.gain = QSpinBox()
-        self.gain.setRange(0, 600)
+        self.gain.setRange(0, 600)  # ZWO varies; we keep wide
         self.gain.setValue(120)
 
         self.images_per_block = QSpinBox()
@@ -820,7 +1115,6 @@ class MainWindow(QMainWindow):
         self.btn_stop = QPushButton("STOP")
         self.btn_gallery = QPushButton("GALERÍA")
 
-        # Styles
         def style_neutral(btn: QPushButton):
             btn.setStyleSheet("""
                 QPushButton {
@@ -835,7 +1129,6 @@ class MainWindow(QMainWindow):
                 QPushButton:hover { background: rgba(255,255,255,22); }
                 QPushButton:disabled { background: rgba(255,255,255,8); color: rgba(255,255,255,120); }
             """)
-
         style_neutral(self.btn_camera)
         style_neutral(self.btn_preview)
         style_neutral(self.btn_gallery)
@@ -867,7 +1160,6 @@ class MainWindow(QMainWindow):
             QPushButton:disabled { background: #5f2f2f; color: rgba(255,255,255,120); }
         """)
 
-        # Wiring
         self.btn_camera.clicked.connect(self._open_camera_config)
         self.btn_preview.clicked.connect(self._on_preview)
         self.btn_start.clicked.connect(self._on_start)
@@ -897,7 +1189,6 @@ class MainWindow(QMainWindow):
         self.blocks.valueChanged.connect(self._update_total)
         self._update_total()
 
-        # Fullscreen actions
         self._act_fs = QAction("Fullscreen", self)
         self._act_fs.setShortcut("F11")
         self._act_fs.triggered.connect(self._toggle_fullscreen)
@@ -915,7 +1206,6 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.hud.move(14, 14)
-        # re-scale pixmap if exists
         pm = self.preview.pixmap()
         if pm and not pm.isNull():
             scaled = pm.scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
@@ -948,7 +1238,6 @@ class MainWindow(QMainWindow):
             self.btn_start.setEnabled(True)
             self.btn_start.setText("START")
 
-        # preview should be disabled only while running a capture session
         self.btn_preview.setEnabled(not running)
 
     def _open_camera_config(self):
@@ -959,14 +1248,19 @@ class MainWindow(QMainWindow):
     def _on_preview(self):
         if self._state == "RUNNING":
             return
-
-        # avoid multiple preview threads
         if self._preview_thread and self._preview_thread.isRunning():
+            return
+
+        ok, msg = self._cam_manager.is_available()
+        if not ok:
+            QMessageBox.critical(self, "ZWO", msg)
+            return
+        if not self._cam_manager.is_connected():
+            QMessageBox.information(self, "ZWO", "Conecta una cámara primero (botón CÁMARA).")
             return
 
         exposure_s = float(self.exposure.value())
         gain = int(self.gain.value())
-
         self._update_hud(extra="PREVIEW: capturando...")
 
         self._preview_thread = QThread(self)
@@ -994,7 +1288,7 @@ class MainWindow(QMainWindow):
     def _on_preview_finished(self):
         if self._preview_thread:
             self._preview_thread.quit()
-            self._preview_thread.wait(1000)
+            self._preview_thread.wait(1500)
         self._preview_thread = None
         self._preview_worker = None
         self._update_hud()
@@ -1005,6 +1299,14 @@ class MainWindow(QMainWindow):
             return
 
         if self._worker_thread and self._worker_thread.isRunning():
+            return
+
+        ok, msg = self._cam_manager.is_available()
+        if not ok:
+            QMessageBox.critical(self, "ZWO", msg)
+            return
+        if not self._cam_manager.is_connected():
+            QMessageBox.information(self, "ZWO", "Conecta una cámara primero (botón CÁMARA).")
             return
 
         params = self._gather_params()
@@ -1040,7 +1342,7 @@ class MainWindow(QMainWindow):
         if st in ("DONE", "STOPPED", "ERROR"):
             if self._worker_thread:
                 self._worker_thread.quit()
-                self._worker_thread.wait(1000)
+                self._worker_thread.wait(2000)
             self._worker_thread = None
             self._worker = None
 
