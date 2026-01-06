@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(pwd)/venv/bin/activate"
+
+# Si tu archivo principal se llama distinto, cámbialo aquí:
+APP="astro_capture_app.py"
+
+python3 "$APP"
