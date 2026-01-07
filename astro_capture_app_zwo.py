@@ -77,9 +77,10 @@ class CaptureParams:
 class ZwoCameraManager:
     """
     Real ZWO manager using zwoasi + ASICamera2 SDK.
-    - lists connected cameras
-    - connect/disconnect
-    - capture RAW16 and produce preview (grayscale stretch for now)
+
+    Notes about zwoasi:
+    - zwoasi.Camera(index) effectively "opens" the camera; there is no camera.open().
+    - ROI helpers are typically get_roi_format()/set_roi_format(). Some builds expose get_roi().
     """
     def __init__(self):
         self._asi = None
@@ -92,7 +93,6 @@ class ZwoCameraManager:
         self._init_asi()
 
     def _find_asi_lib(self) -> Optional[str]:
-        # You can also export ASI_SDK_LIB=/path/to/libASICamera2.so
         env = os.environ.get("ASI_SDK_LIB", "").strip()
         if env and os.path.isfile(env):
             return env
@@ -118,7 +118,7 @@ class ZwoCameraManager:
                 self._asi = asi
                 self._lib_ok = False
                 return
-            asi.init(lib)
+            asi.init(lib)  # idempotent
             self._asi = asi
             self._lib_ok = True
         except Exception:
@@ -137,9 +137,7 @@ class ZwoCameraManager:
         if not ok:
             self._last_list = []
             return []
-
         names = self._asi.list_cameras()
-        # list_cameras() devuelve nombres, el número de cámaras conectadas.
         self._last_list = list(names)
         return self._last_list
 
@@ -150,7 +148,7 @@ class ZwoCameraManager:
         if not self.is_connected():
             return "Ninguna"
         try:
-            return self._cam_props.get("Name", f"Camera #{self._connected_index}")  # zwoasi returns dict-like
+            return self._cam_props.get("Name", f"Camera #{self._connected_index}")
         except Exception:
             return f"Camera #{self._connected_index}"
 
@@ -163,17 +161,21 @@ class ZwoCameraManager:
         if index < 0 or index >= len(names):
             raise ValueError("Índice de cámara inválido.")
 
-        # close any existing
         self.disconnect()
 
-        cam = self._asi.Camera(index)
-        cam.open()
-        cam.init_camera()
+        cam = self._asi.Camera(index)  # already opened
         props = cam.get_camera_property()
 
-        # Set defaults: RAW16 full frame
         try:
             cam.set_image_type(self._asi.ASI_IMG_RAW16)
+        except Exception:
+            pass
+
+        try:
+            max_w = int(props.get("MaxWidth", 0))
+            max_h = int(props.get("MaxHeight", 0))
+            if max_w > 0 and max_h > 0 and hasattr(cam, "set_roi_format"):
+                cam.set_roi_format(max_w, max_h, 1, getattr(self._asi, "ASI_IMG_RAW16", 0))
         except Exception:
             pass
 
@@ -195,34 +197,31 @@ class ZwoCameraManager:
         if not self.is_connected():
             raise RuntimeError("No hay cámara conectada. Abre CÁMARA y conecta una.")
 
-    def get_controls_info(self) -> dict:
-        self._ensure_connected()
-        return self._cam.get_controls()
+    def _get_roi_tuple(self):
+        cam = self._cam
+        if hasattr(cam, "get_roi_format"):
+            return cam.get_roi_format()
+        if hasattr(cam, "get_roi"):
+            return cam.get_roi()
+        props = self._cam_props or {}
+        return int(props.get("MaxWidth", 0)), int(props.get("MaxHeight", 0)), 1, getattr(self._asi, "ASI_IMG_RAW16", 0)
 
     def capture_raw16(self, exposure_s: float, gain: int) -> Tuple[np.ndarray, dict]:
-        """
-        Returns (image array, meta). For color cameras this is Bayer RAW16.
-        For preview we will treat it as grayscale.
-        """
         self._ensure_connected()
 
         asi = self._asi
         cam = self._cam
 
-        # Exposure in microseconds
-        cam.set_control_value(asi.ASI_EXPOSURE, int(exposure_s * 1_000_000))
-        cam.set_control_value(asi.ASI_GAIN, int(gain))
+        cam.set_control_value(asi.ASI_EXPOSURE, int(exposure_s * 1_000_000), False)
+        cam.set_control_value(asi.ASI_GAIN, int(gain), False)
 
-        # Ensure RAW16
         try:
             cam.set_image_type(asi.ASI_IMG_RAW16)
         except Exception:
             pass
 
-        # Start single exposure
         cam.start_exposure(False)
 
-        # Poll status
         while True:
             st = cam.get_exposure_status()
             if st == asi.ASI_EXP_WORKING:
@@ -233,20 +232,19 @@ class ZwoCameraManager:
             break
 
         data = cam.get_data_after_exposure()
-        width, height, binning, image_type = cam.get_roi()
+        width, height, binning, image_type = self._get_roi_tuple()
 
-        # RAW16 -> uint16
         arr = np.frombuffer(data, dtype=np.uint16)
-        if arr.size != width * height:
-            # Some cameras may return padded data depending on ROI; best effort:
-            arr = arr[:width * height]
-        img = arr.reshape((height, width))
+        expected = int(width) * int(height)
+        if expected > 0 and arr.size != expected:
+            arr = arr[:expected]
+        img = arr.reshape((int(height), int(width)))
 
         meta = {
-            "width": width,
-            "height": height,
-            "bin": binning,
-            "image_type": image_type,
+            "width": int(width),
+            "height": int(height),
+            "bin": int(binning),
+            "image_type": int(image_type),
             "camera_name": self.connected_name(),
             "exposure_s": exposure_s,
             "gain": gain,
@@ -258,13 +256,6 @@ class ZwoCameraManager:
 # Image utilities
 # ----------------------------
 def stretch_u16_to_u8(img_u16: np.ndarray, black: int, white: int, gamma: float) -> np.ndarray:
-    """
-    Simple stretch:
-      - clip to [black, white]
-      - normalize to 0..1
-      - apply gamma
-      - output uint8
-    """
     a = img_u16.astype(np.float32)
     b = float(max(0, min(black, 65535)))
     w = float(max(b + 1, min(white, 65535)))
@@ -339,9 +330,6 @@ class SessionManager:
 # Histogram widget
 # ----------------------------
 class HistogramWidget(QWidget):
-    """
-    Displays histogram of a uint8 grayscale image.
-    """
     def __init__(self, parent=None):
         super().__init__(parent)
         self._hist = np.zeros(256, dtype=np.int64)
@@ -374,11 +362,9 @@ class HistogramWidget(QWidget):
             painter.end()
             return
 
-        # Normalize
         hist = self._hist.astype(np.float32)
         hist = hist / hist.max()
 
-        # Draw bars
         pen = QPen(QColor(220, 220, 220, 180))
         painter.setPen(pen)
 
@@ -387,7 +373,6 @@ class HistogramWidget(QWidget):
             bar_h = int(hist[x] * h)
             painter.drawLine(vx, rect.bottom(), vx, rect.bottom() - bar_h)
 
-        # Draw black/white markers
         marker_pen = QPen(QColor(80, 200, 255, 220))
         marker_pen.setWidth(2)
         painter.setPen(marker_pen)
@@ -404,7 +389,7 @@ class HistogramWidget(QWidget):
 # Workers
 # ----------------------------
 class PreviewWorker(QObject):
-    preview_ready = Signal(QImage, float, int, str)  # qimg, exposure, gain, camera_name
+    preview_ready = Signal(QImage, float, int, str)
     error = Signal(str)
     finished = Signal()
 
@@ -417,8 +402,6 @@ class PreviewWorker(QObject):
     def run(self):
         try:
             img_u16, meta = self._cam_manager.capture_raw16(self._exposure_s, self._gain)
-            # default stretch for preview
-            # simple auto black/white from percentiles:
             lo = int(np.percentile(img_u16, 1.0))
             hi = int(np.percentile(img_u16, 99.7))
             u8 = stretch_u16_to_u8(img_u16, lo, hi, gamma=1.0)
@@ -489,9 +472,8 @@ class CaptureWorker(QObject):
                         self.state_changed.emit("STOPPED")
                         return
 
-                    img_u16, meta = self._cam_manager.capture_raw16(params.exposure_s, params.gain)
+                    img_u16, _meta = self._cam_manager.capture_raw16(params.exposure_s, params.gain)
 
-                    # For saving preview PNG: auto stretch each frame for usability
                     lo = int(np.percentile(img_u16, 1.0))
                     hi = int(np.percentile(img_u16, 99.7))
                     u8 = stretch_u16_to_u8(img_u16, lo, hi, gamma=1.0)
@@ -508,7 +490,6 @@ class CaptureWorker(QObject):
                         global_idx, params.exposure_s, params.gain, cam_name
                     )
 
-                # pause between blocks
                 if b < params.blocks:
                     self.state_changed.emit("PAUSED_BETWEEN_BLOCKS")
                     self._wait_for_resume_or_stop()
@@ -659,7 +640,6 @@ class ImageViewerWindow(QMainWindow):
 
         self._hist = HistogramWidget()
 
-        # sliders
         self._slider_black = QSlider(Qt.Horizontal)
         self._slider_white = QSlider(Qt.Horizontal)
         self._slider_gamma = QSlider(Qt.Horizontal)
@@ -669,9 +649,8 @@ class ImageViewerWindow(QMainWindow):
         self._slider_black.setValue(0)
         self._slider_white.setValue(255)
 
-        # gamma slider: map 10..300 -> 0.10..3.00
         self._slider_gamma.setRange(10, 300)
-        self._slider_gamma.setValue(100)  # 1.00
+        self._slider_gamma.setValue(100)
 
         def style_slider(sl: QSlider):
             sl.setStyleSheet("""
@@ -714,14 +693,13 @@ class ImageViewerWindow(QMainWindow):
         root_layout.addWidget(panel, 0)
         self.setCentralWidget(root)
 
-        self._img_u8_orig = None  # original loaded image as uint8 (grayscale)
-        self._img_u8_disp = None  # stretched
+        self._img_u8_orig = None
+        self._img_u8_disp = None
 
         self._slider_black.valueChanged.connect(self._on_stretch_changed)
         self._slider_white.valueChanged.connect(self._on_stretch_changed)
         self._slider_gamma.valueChanged.connect(self._on_stretch_changed)
 
-        # Overlay buttons
         self._btn_delete = self._make_overlay_btn("🗑")
         self._btn_zoomin = self._make_overlay_btn("➕")
         self._btn_zoomout = self._make_overlay_btn("➖")
@@ -788,19 +766,17 @@ class ImageViewerWindow(QMainWindow):
         h = self.height()
         buttons = [self._btn_delete, self._btn_zoomin, self._btn_zoomout, self._btn_fit, self._btn_close]
         for idx, b in enumerate(buttons):
-            x = w - margin - size - 320  # account for histogram panel
+            x = w - margin - size - 320
             y = h - margin - size - idx * (size + gap)
             b.setGeometry(QRect(x, y, size, size))
 
     def _load_image(self):
-        # Load PNG/JPG etc. Convert to grayscale uint8
         if not os.path.isfile(self._image_path):
             raise RuntimeError("Imagen no existe.")
         im = Image.open(self._image_path).convert("L")
         arr = np.array(im, dtype=np.uint8)
         self._img_u8_orig = arr
 
-        # auto initial stretch: percentiles
         lo = int(np.percentile(arr, 1.0))
         hi = int(np.percentile(arr, 99.7))
         self._slider_black.setValue(lo)
@@ -1011,20 +987,18 @@ class MainWindow(QMainWindow):
         self._cam_manager = ZwoCameraManager()
 
         self._session_dir = None
-        self._state = "READY"  # READY, RUNNING, PAUSED_BETWEEN_BLOCKS, STOPPED, DONE, ERROR
+        self._state = "READY"
         self._worker_thread = None
         self._worker = None
 
         self._preview_thread = None
         self._preview_worker = None
 
-        # Preview label
         self.preview = QLabel("Sin imagen aún")
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setStyleSheet("background: #000; color: rgba(255,255,255,140); font-size: 18px;")
         self.preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        # HUD overlay
         self.hud = QLabel("")
         self.hud.setStyleSheet("""
             QLabel {
@@ -1040,7 +1014,6 @@ class MainWindow(QMainWindow):
         self.hud.setParent(self.preview)
         self.hud.move(14, 14)
 
-        # Right panel
         right = QWidget()
         right.setFixedWidth(360)
         right_layout = QVBoxLayout(right)
@@ -1071,7 +1044,7 @@ class MainWindow(QMainWindow):
         self.exposure.setSingleStep(0.5)
 
         self.gain = QSpinBox()
-        self.gain.setRange(0, 600)  # ZWO varies; we keep wide
+        self.gain.setRange(0, 600)
         self.gain.setValue(120)
 
         self.images_per_block = QSpinBox()
@@ -1108,7 +1081,6 @@ class MainWindow(QMainWindow):
 
         right_layout.addWidget(group)
 
-        # Buttons
         self.btn_camera = QPushButton("CÁMARA")
         self.btn_preview = QPushButton("PREVIEW")
         self.btn_start = QPushButton("START")
