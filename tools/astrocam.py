@@ -1,0 +1,1 @@
+# Astrocam CLI placeholder
