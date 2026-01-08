@@ -3,9 +3,9 @@
 
 """
 Astro Capture App (ZWO Real) - split files version
-- main_window.py: Main window + ZWO manager + workers + session saving
-- gallery_window.py: Gallery (adaptive grid, vertical scroll only)
-- viewer_window.py: Viewer (fit image, compact sliders, B/W or color histogram)
+- astro_capture_app_zwo.py: Main window + ZWO manager + workers + session saving
+- astro_capture_gallery.py: Gallery (adaptive grid, vertical scroll only)
+- astro_capture_viewer.py: Viewer (fit image, compact sliders, B/W or color histogram)
 """
 
 from PySide6.QtWidgets import QDialog, QDialogButtonBox
@@ -78,6 +78,7 @@ class CaptureParams:
     # cv2 conversion code name string (e.g. "COLOR_BayerRGGB2RGB")
     debayer: str
     out_format: str        # "PNG"|"JPG"|"TIFF"|"DNG"|"FITS"
+    pause_between_blocks: bool
 
 
 # ----------------------------
@@ -90,7 +91,6 @@ class ZwoCameraManager:
       - image type selection (RAW8/RAW16/RGB24)
       - bin selection
       - WB_R, WB_B, BRIGHTNESS
-      - abort exposure for STOP responsiveness
     """
 
     def __init__(self):
@@ -216,7 +216,6 @@ class ZwoCameraManager:
         """Always set ROI to max resolution allowed for selected bin."""
         self._ensure_connected()
         cam = self._cam
-        asi = self._asi
 
         max_w, max_h = self.get_sensor_size()
         b = max(1, min(int(binning), 4))
@@ -242,6 +241,8 @@ class ZwoCameraManager:
 
         def safe_set(ctrl, val):
             try:
+                if ctrl is None:
+                    return
                 cam.set_control_value(ctrl, int(val), False)
             except Exception:
                 pass
@@ -249,19 +250,6 @@ class ZwoCameraManager:
         safe_set(getattr(asi, "ASI_WB_R", None), wb_r)
         safe_set(getattr(asi, "ASI_WB_B", None), wb_b)
         safe_set(getattr(asi, "ASI_BRIGHTNESS", None), brightness)
-
-    def abort_exposure(self):
-        """Best-effort abort for responsiveness when STOP pressed."""
-        if not self.is_connected():
-            return
-        cam = self._cam
-        for name in ("stop_exposure", "stopExposure", "abort_exposure", "abortExposure"):
-            if hasattr(cam, name):
-                try:
-                    getattr(cam, name)()
-                    return
-                except Exception:
-                    pass
 
     def _get_roi_tuple(self):
         cam = self._cam
@@ -284,6 +272,10 @@ class ZwoCameraManager:
         Returns:
           - RAW8/RAW16: ndarray (H,W) uint8/uint16
           - RGB24: ndarray (H,W,3) uint8
+
+        Nota STOP:
+          - STOP **no aborta** la exposición actual: termina la foto en curso y
+            el worker se detiene antes de iniciar la siguiente.
         """
         self._ensure_connected()
 
@@ -305,13 +297,10 @@ class ZwoCameraManager:
         except Exception:
             pass
 
-        # Prefer single exposure API (start_exposure / get_data_after_exposure)
         cam.start_exposure(False)
 
+        # Esperar a que termine la exposición (sin abortar por STOP)
         while True:
-            if should_stop and should_stop():
-                self.abort_exposure()
-                raise RuntimeError("STOP solicitado.")
             st = cam.get_exposure_status()
             if st == asi.ASI_EXP_WORKING:
                 time.sleep(0.01)
@@ -416,12 +405,31 @@ def _rgb_u8_to_qimage(rgb_u8: np.ndarray) -> QImage:
     return qimg.copy()
 
 
-def make_preview_qimage(img: np.ndarray, mode: str) -> QImage:
-    if mode == "RAW16":
-        u8 = _stretch_u16_to_u8(img)
-        return _gray_u8_to_qimage(u8)
-    if mode == "RAW8":
-        # stretch simple percentiles
+def make_preview_qimage(img: np.ndarray, mode: str, debayer_name: str = "") -> QImage:
+    """
+    Preview:
+      - RAW16/RAW8: si hay cv2 + debayer válido => preview COLOR (RGB)
+                  si no => preview B/N estirado
+      - RGB24: preview COLOR (RGB)
+    """
+    cv2 = _try_import_cv2()
+
+    if mode in ("RAW16", "RAW8"):
+        if cv2 is not None and debayer_name and hasattr(cv2, debayer_name):
+            conv = getattr(cv2, debayer_name)
+            if mode == "RAW16":
+                raw8 = (img / 256).astype(np.uint8)
+            else:
+                raw8 = img.astype(np.uint8)
+            rgb = cv2.cvtColor(raw8, conv)
+            norm = _normalize_u8_rgb(rgb)
+            return _rgb_u8_to_qimage(norm)
+
+        # fallback grayscale
+        if mode == "RAW16":
+            u8 = _stretch_u16_to_u8(img)
+            return _gray_u8_to_qimage(u8)
+
         lo = int(np.percentile(img, 1.0))
         hi = int(np.percentile(img, 99.7))
         a = img.astype(np.float32)
@@ -429,8 +437,9 @@ def make_preview_qimage(img: np.ndarray, mode: str) -> QImage:
         a = np.clip(a, 0.0, 1.0)
         u8 = (a * 255.0).astype(np.uint8)
         return _gray_u8_to_qimage(u8)
+
     # RGB24
-    norm = _normalize_u8_rgb(img)
+    norm = _normalize_u8_rgb(img.astype(np.uint8))
     return _rgb_u8_to_qimage(norm)
 
 
@@ -440,15 +449,14 @@ def save_raw_and_output(img: np.ndarray, meta: dict, out_dir: str,
                         debayer_name: str,
                         out_format: str):
     """
-    Always save RAW:
-      - RAW16 -> <base>_raw16_bayer.(fits|tiff|png?) depending on output selection, but RAW is always FITS if possible.
-      - RAW8  -> <base>_raw8_bayer.fits if possible
-      - RGB24 -> <base>_rgb24_raw.fits (3-plane) if possible
+    RAW siempre se guarda:
+      - Preferente FITS (si astropy existe)
+      - Fallback .npy
 
-    Then save "output" (debayered if RAW):
-      - PNG/JPG/TIFF: debayer to RGB for RAW modes if cv2 available, else grayscale preview.
-      - FITS: save RAW and also debayered FITS (3-plane) when possible.
-      - DNG: not implemented (will raise).
+    OUTPUT:
+      - PNG/JPG/TIFF: si RAW y debayer válido => RGB. Si no => B/N.
+      - FITS: guarda además un FITS "output" (RGB si debayer).
+      - DNG: no implementado.
     """
     os.makedirs(out_dir, exist_ok=True)
     fits = _try_import_fits()
@@ -475,7 +483,6 @@ def save_raw_and_output(img: np.ndarray, meta: dict, out_dir: str,
                 raw_path, overwrite=True)
             raw_saved_paths.append(raw_path)
         else:  # RGB24
-            # store as (3, H, W) uint16 (shift) for compatibility
             rgb = img.astype(np.uint16) << 8
             data = np.stack([rgb[..., 0], rgb[..., 1], rgb[..., 2]], axis=0)
             raw_path = os.path.join(out_dir, f"{stem}_rgb24_raw.fits")
@@ -483,7 +490,6 @@ def save_raw_and_output(img: np.ndarray, meta: dict, out_dir: str,
                 raw_path, overwrite=True)
             raw_saved_paths.append(raw_path)
     else:
-        # fallback raw: .npy
         raw_path = os.path.join(out_dir, f"{stem}_{mode.lower()}_raw.npy")
         np.save(raw_path, img)
         raw_saved_paths.append(raw_path)
@@ -494,7 +500,6 @@ def save_raw_and_output(img: np.ndarray, meta: dict, out_dir: str,
         raise RuntimeError(
             "DNG aún no está implementado en esta versión (pendiente).")
 
-    # Prepare "display/export" image
     export_img = None
     export_is_rgb = False
 
@@ -502,7 +507,6 @@ def save_raw_and_output(img: np.ndarray, meta: dict, out_dir: str,
         if cv2 is not None and debayer_name and hasattr(cv2, debayer_name):
             conv = getattr(cv2, debayer_name)
             if mode == "RAW16":
-                # down to 8-bit for cv2 debayer (fast). For scientific keep RAW FITS already.
                 raw8 = (img / 256).astype(np.uint8)
             else:
                 raw8 = img.astype(np.uint8)
@@ -510,7 +514,6 @@ def save_raw_and_output(img: np.ndarray, meta: dict, out_dir: str,
             export_img = _normalize_u8_rgb(rgb)
             export_is_rgb = True
         else:
-            # grayscale export
             if mode == "RAW16":
                 export_img = _stretch_u16_to_u8(img)
             else:
@@ -595,6 +598,7 @@ class SessionManager:
             "brightness": params.brightness,
             "debayer": params.debayer,
             "out_format": params.out_format,
+            "pause_between_blocks": bool(params.pause_between_blocks),
         }
         with open(os.path.join(session_dir, "config_session.json"), "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
@@ -626,7 +630,7 @@ class PreviewWorker(QObject):
                 brightness=self._p.brightness,
                 should_stop=self._stop_flag
             )
-            qimg = make_preview_qimage(img, self._p.img_type)
+            qimg = make_preview_qimage(img, self._p.img_type, self._p.debayer)
             self.preview_ready.emit(
                 qimg, self._p.exposure_s, self._p.gain, meta["camera_name"], self._p.img_type)
         except Exception as e:
@@ -661,19 +665,18 @@ class LivePreviewWorker(QObject):
                     brightness=self._p.brightness,
                     should_stop=self._stop_flag
                 )
-                qimg = make_preview_qimage(img, self._p.img_type)
+                qimg = make_preview_qimage(
+                    img, self._p.img_type, self._p.debayer)
                 frames += 1
                 now = time.time()
                 dt = now - last
                 fps = frames / dt if dt > 0.1 else 0.0
-                # refresh fps window every ~2s
                 if dt > 2.0:
                     last = now
                     frames = 0
                 self.preview_ready.emit(
                     qimg, self._p.exposure_s, self._p.gain, meta["camera_name"], self._p.img_type, fps)
         except Exception as e:
-            # STOP solicitado no es error para el usuario
             msg = str(e)
             if "STOP solicitado" not in msg:
                 self.error.emit(msg)
@@ -699,16 +702,12 @@ class CaptureWorker(QObject):
         self._session_mgr = SessionManager(base_path)
 
     def request_stop(self):
+        # STOP: termina la foto en curso y detiene antes de la siguiente
         self._mutex.lock()
         self._stop = True
         self._pause_waiting = False
         self._cond.wakeAll()
         self._mutex.unlock()
-        # also abort any on-going exposure
-        try:
-            self._cam_manager.abort_exposure()
-        except Exception:
-            pass
 
     def request_resume(self):
         self._mutex.lock()
@@ -768,7 +767,7 @@ class CaptureWorker(QObject):
                     global_idx += 1
                     base_name = f"img_{global_idx:06d}"
                     try:
-                        raw_paths, out_path = save_raw_and_output(
+                        _, out_path = save_raw_and_output(
                             img=img, meta=meta, out_dir=block_dir,
                             base_name=base_name,
                             mode=params.img_type,
@@ -776,15 +775,17 @@ class CaptureWorker(QObject):
                             out_format=params.out_format
                         )
                         saved_path = out_path
-                    except Exception as e:
+                    except Exception:
                         # fallback: always save preview PNG
-                        qimg = make_preview_qimage(img, params.img_type)
+                        qimg = make_preview_qimage(
+                            img, params.img_type, params.debayer)
                         preview_path = os.path.join(
                             block_dir, f"{base_name}_preview.png")
                         qimg.save(preview_path)
                         saved_path = preview_path
 
-                    qimg = make_preview_qimage(img, params.img_type)
+                    qimg = make_preview_qimage(
+                        img, params.img_type, params.debayer)
 
                     self.frame_ready.emit(
                         qimg, saved_path,
@@ -794,7 +795,8 @@ class CaptureWorker(QObject):
                         params.img_type
                     )
 
-                if b < params.blocks:
+                # Pausa entre bloques SOLO si el usuario lo pidió
+                if b < params.blocks and params.pause_between_blocks:
                     self.state_changed.emit("PAUSED_BETWEEN_BLOCKS")
                     self._wait_for_resume_or_stop()
                     if self._should_stop():
@@ -818,8 +820,6 @@ class CaptureWorker(QObject):
 # ----------------------------
 # Camera config dialog (minimal)
 # ----------------------------
-
-
 class CameraConfigDialog(QDialog):
     def __init__(self, cam_manager: ZwoCameraManager, parent=None):
         super().__init__(parent)
@@ -1002,6 +1002,10 @@ class MainWindow(QMainWindow):
                 border-radius: 12px;
                 background: rgba(255,255,255,6);
             }
+            QGroupBox QLabel {
+                color: rgba(255,255,255,210);
+                font-weight: 600;
+            }
         """)
         form = QFormLayout(group)
         form.setLabelAlignment(Qt.AlignLeft)
@@ -1026,8 +1030,7 @@ class MainWindow(QMainWindow):
         self.blocks.setRange(1, 999)
         self.blocks.setValue(3)
 
-        self.chk_pause = QCheckBox("Pausa entre Bloques")
-
+        self.chk_pause = QCheckBox()
         self.session_name = QLineEdit()
         self.session_name.setPlaceholderText("Ej: M42_AskarV")
 
@@ -1050,7 +1053,6 @@ class MainWindow(QMainWindow):
         self.brightness.setValue(50)
 
         self.combo_debayer = QComboBox()
-        # Most common OpenCV Bayer conversions (RGB output)
         self.combo_debayer.addItems([
             "COLOR_BayerRGGB2RGB",
             "COLOR_BayerBGGR2RGB",
@@ -1067,7 +1069,7 @@ class MainWindow(QMainWindow):
 
         self.total_label = QLabel("0")
         self.total_label.setStyleSheet(
-            "color: rgba(255,255,255,200); font-weight: 700;")
+            "color: rgba(255,255,255,220); font-weight: 800;")
 
         for w in [self.exposure, self.gain, self.images_per_block, self.blocks, self.chk_pause, self.session_name,
                   self.combo_img_type, self.combo_bin, self.wb_r, self.wb_b, self.brightness,
@@ -1080,6 +1082,7 @@ class MainWindow(QMainWindow):
                     border-radius: 8px;
                     padding: 6px;
                 }
+                QCheckBox { color: rgba(255,255,255,220); }
             """)
 
         form.addRow("Exposición (s)", self.exposure)
@@ -1230,7 +1233,6 @@ class MainWindow(QMainWindow):
         self._update_topbar()
 
     def closeEvent(self, event):
-        # stop preview loop
         self._preview_stop_flag = True
         try:
             if self._preview_thread and self._preview_thread.isRunning():
@@ -1239,7 +1241,6 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # stop capture worker
         try:
             if self._worker:
                 self._worker.request_stop()
@@ -1288,6 +1289,7 @@ class MainWindow(QMainWindow):
             brightness=int(self.brightness.value()),
             debayer=self.combo_debayer.currentText().strip(),
             out_format=self.combo_out.currentText().strip(),
+            pause_between_blocks=bool(self.chk_pause.isChecked()),
         )
 
     def _apply_state_ui(self):
@@ -1341,7 +1343,6 @@ class MainWindow(QMainWindow):
                 self, "ZWO", "Conecta una cámara primero (botón CÁMARA).")
             return
 
-        # Toggle: if live preview already running -> stop it
         if self._preview_thread and self._preview_thread.isRunning():
             self._stop_preview_thread()
             self._update_topbar("Preview detenido.")
@@ -1356,7 +1357,6 @@ class MainWindow(QMainWindow):
             return self._preview_stop_flag
 
         if self.chk_live.isChecked() or self.chk_video.isChecked():
-            # (Video mode uses same loop for now; later we can swap to start_video_capture if your build supports it)
             self._preview_worker = LivePreviewWorker(
                 self._cam_manager, params, stop_flag)
             self._preview_worker.moveToThread(self._preview_thread)
@@ -1405,6 +1405,7 @@ class MainWindow(QMainWindow):
 
     # ---- Capture session ----
     def _on_start(self):
+        # Resume solo si estamos en pausa entre bloques
         if self._state == "PAUSED_BETWEEN_BLOCKS" and self._worker:
             self._worker.request_resume()
             return
@@ -1421,7 +1422,6 @@ class MainWindow(QMainWindow):
                 self, "ZWO", "Conecta una cámara primero (botón CÁMARA).")
             return
 
-        # stop any preview loop
         if self._preview_thread and self._preview_thread.isRunning():
             self._stop_preview_thread()
 
@@ -1450,7 +1450,6 @@ class MainWindow(QMainWindow):
         self._update_topbar(f"Sesión creada: {os.path.basename(session_dir)}")
 
     def _on_error(self, msg: str):
-        # STOP solicitado no es realmente error para UX
         if "STOP solicitado" in msg:
             return
         QMessageBox.critical(self, "Error", msg)
@@ -1478,9 +1477,9 @@ class MainWindow(QMainWindow):
                            Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.preview.setPixmap(scaled)
 
-        # Top bar sequence info
         self.lbl_seq.setText(
-            f"SEQ {block_idx}/{blocks_total} | IMG {idx_in_block}/{imgs_per_block} | global {global_idx} | {mode}")
+            f"SEQ {block_idx}/{blocks_total} | IMG {idx_in_block}/{imgs_per_block} | global {global_idx} | {mode}"
+        )
 
     def _open_gallery(self):
         default_dir = self._session_dir if self._session_dir else self._base_path
