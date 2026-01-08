@@ -8,6 +8,7 @@ Astro Capture App (ZWO Real) - split files version
 - viewer_window.py: Viewer (fit image, compact sliders, B/W or color histogram)
 """
 
+from PySide6.QtWidgets import QDialog, QDialogButtonBox
 import os
 import sys
 import json
@@ -74,7 +75,8 @@ class CaptureParams:
     wb_r: int              # 0..100 (common ZWO ranges vary)
     wb_b: int              # 0..100
     brightness: int        # 0..100
-    debayer: str           # cv2 conversion code name string (e.g. "COLOR_BayerRGGB2RGB")
+    # cv2 conversion code name string (e.g. "COLOR_BayerRGGB2RGB")
+    debayer: str
     out_format: str        # "PNG"|"JPG"|"TIFF"|"DNG"|"FITS"
 
 
@@ -90,6 +92,7 @@ class ZwoCameraManager:
       - WB_R, WB_B, BRIGHTNESS
       - abort exposure for STOP responsiveness
     """
+
     def __init__(self):
         self._asi = None
         self._connected_index: Optional[int] = None
@@ -196,7 +199,8 @@ class ZwoCameraManager:
 
     def _ensure_connected(self):
         if not self.is_connected():
-            raise RuntimeError("No hay cámara conectada. Abre CÁMARA y conecta una.")
+            raise RuntimeError(
+                "No hay cámara conectada. Abre CÁMARA y conecta una.")
 
     def _asi_img_type(self, img_type: str):
         asi = self._asi
@@ -291,7 +295,8 @@ class ZwoCameraManager:
         self.apply_color_controls(wb_r=wb_r, wb_b=wb_b, brightness=brightness)
 
         # controls
-        cam.set_control_value(asi.ASI_EXPOSURE, int(float(exposure_s) * 1_000_000), False)
+        cam.set_control_value(asi.ASI_EXPOSURE, int(
+            float(exposure_s) * 1_000_000), False)
         cam.set_control_value(asi.ASI_GAIN, int(gain), False)
 
         it = self._asi_img_type(img_type)
@@ -364,12 +369,14 @@ def _try_import_cv2():
     except Exception:
         return None
 
+
 def _try_import_fits():
     try:
         from astropy.io import fits  # type: ignore
         return fits
     except Exception:
         return None
+
 
 def _normalize_u8_rgb(img_rgb_u8: np.ndarray) -> np.ndarray:
     # Per-channel normalize for preview/export
@@ -381,8 +388,10 @@ def _normalize_u8_rgb(img_rgb_u8: np.ndarray) -> np.ndarray:
         if mx - mn <= 1e-6:
             out[..., c] = 0
         else:
-            out[..., c] = np.clip((ch - mn) / (mx - mn) * 255.0, 0, 255).astype(np.uint8)
+            out[..., c] = np.clip((ch - mn) / (mx - mn)
+                                  * 255.0, 0, 255).astype(np.uint8)
     return out
+
 
 def _stretch_u16_to_u8(img_u16: np.ndarray) -> np.ndarray:
     lo = int(np.percentile(img_u16, 1.0))
@@ -392,17 +401,20 @@ def _stretch_u16_to_u8(img_u16: np.ndarray) -> np.ndarray:
     a = np.clip(a, 0.0, 1.0)
     return (a * 255.0).astype(np.uint8)
 
+
 def _gray_u8_to_qimage(gray_u8: np.ndarray) -> QImage:
     h, w = gray_u8.shape
     g = np.ascontiguousarray(gray_u8)
     qimg = QImage(g.data, w, h, w, QImage.Format_Grayscale8)
     return qimg.copy()
 
+
 def _rgb_u8_to_qimage(rgb_u8: np.ndarray) -> QImage:
     h, w, _ = rgb_u8.shape
     a = np.ascontiguousarray(rgb_u8)
     qimg = QImage(a.data, w, h, w * 3, QImage.Format_RGB888)
     return qimg.copy()
+
 
 def make_preview_qimage(img: np.ndarray, mode: str) -> QImage:
     if mode == "RAW16":
@@ -420,6 +432,7 @@ def make_preview_qimage(img: np.ndarray, mode: str) -> QImage:
     # RGB24
     norm = _normalize_u8_rgb(img)
     return _rgb_u8_to_qimage(norm)
+
 
 def save_raw_and_output(img: np.ndarray, meta: dict, out_dir: str,
                         base_name: str,
@@ -456,15 +469,18 @@ def save_raw_and_output(img: np.ndarray, meta: dict, out_dir: str,
         hdr["DATE"] = datetime.utcnow().isoformat()
 
         if mode in ("RAW16", "RAW8"):
-            raw_path = os.path.join(out_dir, f"{stem}_{mode.lower()}_bayer_raw.fits")
-            fits.PrimaryHDU(data=img, header=hdr).writeto(raw_path, overwrite=True)
+            raw_path = os.path.join(
+                out_dir, f"{stem}_{mode.lower()}_bayer_raw.fits")
+            fits.PrimaryHDU(data=img, header=hdr).writeto(
+                raw_path, overwrite=True)
             raw_saved_paths.append(raw_path)
         else:  # RGB24
             # store as (3, H, W) uint16 (shift) for compatibility
             rgb = img.astype(np.uint16) << 8
             data = np.stack([rgb[..., 0], rgb[..., 1], rgb[..., 2]], axis=0)
             raw_path = os.path.join(out_dir, f"{stem}_rgb24_raw.fits")
-            fits.PrimaryHDU(data=data, header=hdr).writeto(raw_path, overwrite=True)
+            fits.PrimaryHDU(data=data, header=hdr).writeto(
+                raw_path, overwrite=True)
             raw_saved_paths.append(raw_path)
     else:
         # fallback raw: .npy
@@ -475,7 +491,8 @@ def save_raw_and_output(img: np.ndarray, meta: dict, out_dir: str,
     # ---------- OUTPUT saving ----------
     out_format = out_format.upper().strip()
     if out_format == "DNG":
-        raise RuntimeError("DNG aún no está implementado en esta versión (pendiente).")
+        raise RuntimeError(
+            "DNG aún no está implementado en esta versión (pendiente).")
 
     # Prepare "display/export" image
     export_img = None
@@ -514,7 +531,8 @@ def save_raw_and_output(img: np.ndarray, meta: dict, out_dir: str,
 
     if out_format == "FITS":
         if fits is None:
-            raise RuntimeError("astropy no está instalado, no puedo guardar FITS.")
+            raise RuntimeError(
+                "astropy no está instalado, no puedo guardar FITS.")
         hdr = fits.Header()
         hdr["EXPOSURE"] = float(meta.get("exposure_s", 0.0))
         hdr["GAIN"] = int(meta.get("gain", 0))
@@ -529,9 +547,11 @@ def save_raw_and_output(img: np.ndarray, meta: dict, out_dir: str,
                 export_img[..., 1].astype(np.uint16) << 8,
                 export_img[..., 2].astype(np.uint16) << 8
             ], axis=0)
-            fits.PrimaryHDU(data=data, header=hdr).writeto(out_path, overwrite=True)
+            fits.PrimaryHDU(data=data, header=hdr).writeto(
+                out_path, overwrite=True)
         else:
-            fits.PrimaryHDU(data=export_img.astype(np.uint16) << 8, header=hdr).writeto(out_path, overwrite=True)
+            fits.PrimaryHDU(data=export_img.astype(np.uint16) <<
+                            8, header=hdr).writeto(out_path, overwrite=True)
         return raw_saved_paths, out_path
 
     raise RuntimeError(f"Formato de salida no soportado: {out_format}")
@@ -545,7 +565,8 @@ class SessionManager:
         self.base_path = base_path
 
     def create_session_dir(self, session_name: str) -> str:
-        safe = "".join(c for c in session_name.strip() if c.isalnum() or c in ("-", "_", " "))
+        safe = "".join(c for c in session_name.strip()
+                       if c.isalnum() or c in ("-", "_", " "))
         safe = safe.strip().replace(" ", "_") or "Sesion"
         stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         folder = f"{safe}_{stamp}"
@@ -606,7 +627,8 @@ class PreviewWorker(QObject):
                 should_stop=self._stop_flag
             )
             qimg = make_preview_qimage(img, self._p.img_type)
-            self.preview_ready.emit(qimg, self._p.exposure_s, self._p.gain, meta["camera_name"], self._p.img_type)
+            self.preview_ready.emit(
+                qimg, self._p.exposure_s, self._p.gain, meta["camera_name"], self._p.img_type)
         except Exception as e:
             self.error.emit(str(e))
         finally:
@@ -648,7 +670,8 @@ class LivePreviewWorker(QObject):
                 if dt > 2.0:
                     last = now
                     frames = 0
-                self.preview_ready.emit(qimg, self._p.exposure_s, self._p.gain, meta["camera_name"], self._p.img_type, fps)
+                self.preview_ready.emit(
+                    qimg, self._p.exposure_s, self._p.gain, meta["camera_name"], self._p.img_type, fps)
         except Exception as e:
             # STOP solicitado no es error para el usuario
             msg = str(e)
@@ -659,7 +682,8 @@ class LivePreviewWorker(QObject):
 
 
 class CaptureWorker(QObject):
-    frame_ready = Signal(QImage, str, int, int, int, int, int, float, int, str, str)
+    frame_ready = Signal(QImage, str, int, int, int,
+                         int, int, float, int, str, str)
     state_changed = Signal(str)
     error = Signal(str)
     session_created = Signal(str)
@@ -706,9 +730,11 @@ class CaptureWorker(QObject):
             self._mutex.unlock()
 
             if not self._cam_manager.is_connected():
-                raise RuntimeError("No hay cámara conectada. Abre CÁMARA y conecta una.")
+                raise RuntimeError(
+                    "No hay cámara conectada. Abre CÁMARA y conecta una.")
 
-            session_dir = self._session_mgr.create_session_dir(params.session_name)
+            session_dir = self._session_mgr.create_session_dir(
+                params.session_name)
             self._session_mgr.save_session_config(session_dir, params)
             self.session_created.emit(session_dir)
 
@@ -753,7 +779,8 @@ class CaptureWorker(QObject):
                     except Exception as e:
                         # fallback: always save preview PNG
                         qimg = make_preview_qimage(img, params.img_type)
-                        preview_path = os.path.join(block_dir, f"{base_name}_preview.png")
+                        preview_path = os.path.join(
+                            block_dir, f"{base_name}_preview.png")
                         qimg.save(preview_path)
                         saved_path = preview_path
 
@@ -791,7 +818,7 @@ class CaptureWorker(QObject):
 # ----------------------------
 # Camera config dialog (minimal)
 # ----------------------------
-from PySide6.QtWidgets import QDialog, QDialogButtonBox
+
 
 class CameraConfigDialog(QDialog):
     def __init__(self, cam_manager: ZwoCameraManager, parent=None):
@@ -803,11 +830,13 @@ class CameraConfigDialog(QDialog):
         layout = QVBoxLayout(self)
 
         self.lbl_status = QLabel("")
-        self.lbl_status.setStyleSheet("color: rgba(255,255,255,220); font-size: 14px;")
+        self.lbl_status.setStyleSheet(
+            "color: rgba(255,255,255,220); font-size: 14px;")
         layout.addWidget(self.lbl_status)
 
         self.lbl_info = QLabel("")
-        self.lbl_info.setStyleSheet("color: rgba(255,255,255,160); font-size: 12px;")
+        self.lbl_info.setStyleSheet(
+            "color: rgba(255,255,255,160); font-size: 12px;")
         layout.addWidget(self.lbl_info)
 
         self.combo = QComboBox()
@@ -872,7 +901,8 @@ class CameraConfigDialog(QDialog):
         self._update_status()
 
     def _update_status(self):
-        self.lbl_status.setText(f"Cámara conectada: {self._cam_manager.connected_name()}")
+        self.lbl_status.setText(
+            f"Cámara conectada: {self._cam_manager.connected_name()}")
 
     def _connect_selected(self):
         try:
@@ -930,22 +960,27 @@ class MainWindow(QMainWindow):
         self.lbl_top.setStyleSheet("""
             QLabel { color: rgba(255,255,255,230); font-size: 18px; font-weight: 700; }
         """)
-        self.lbl_top.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.lbl_top.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Preferred)
 
         self.lbl_seq = QLabel("")
-        self.lbl_seq.setStyleSheet("color: rgba(255,255,255,200); font-size: 14px; font-family: monospace;")
+        self.lbl_seq.setStyleSheet(
+            "color: rgba(255,255,255,200); font-size: 14px; font-family: monospace;")
         self.lbl_seq.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
         tb.addWidget(self.lbl_top, 1)
         tb.addWidget(self.lbl_seq, 0)
 
-        self.topbar.setStyleSheet("background: rgba(0,0,0,140); border: 1px solid rgba(255,255,255,40); border-radius: 10px;")
+        self.topbar.setStyleSheet(
+            "background: rgba(0,0,0,140); border: 1px solid rgba(255,255,255,40); border-radius: 10px;")
         left_layout.addWidget(self.topbar, 0)
 
         self.preview = QLabel("Sin imagen aún")
         self.preview.setAlignment(Qt.AlignCenter)
-        self.preview.setStyleSheet("background: #000; color: rgba(255,255,255,140); font-size: 18px; border-radius: 10px;")
-        self.preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.preview.setStyleSheet(
+            "background: #000; color: rgba(255,255,255,140); font-size: 18px; border-radius: 10px;")
+        self.preview.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Expanding)
         left_layout.addWidget(self.preview, 1)
 
         # ---------- Right panel ----------
@@ -956,7 +991,8 @@ class MainWindow(QMainWindow):
         right_layout.setSpacing(10)
 
         title = QLabel("Configuración")
-        title.setStyleSheet("color: rgba(255,255,255,220); font-size: 18px; font-weight: 600;")
+        title.setStyleSheet(
+            "color: rgba(255,255,255,220); font-size: 18px; font-weight: 600;")
         right_layout.addWidget(title)
 
         group = QGroupBox("")
@@ -990,6 +1026,8 @@ class MainWindow(QMainWindow):
         self.blocks.setRange(1, 999)
         self.blocks.setValue(3)
 
+        self.chk_pause = QCheckBox("Pausa entre Bloques")
+
         self.session_name = QLineEdit()
         self.session_name.setPlaceholderText("Ej: M42_AskarV")
 
@@ -1001,9 +1039,15 @@ class MainWindow(QMainWindow):
         self.combo_bin.addItems(["BIN1", "BIN2", "BIN3", "BIN4"])
         self.combo_bin.setCurrentText("BIN1")
 
-        self.wb_r = QSpinBox(); self.wb_r.setRange(0, 100); self.wb_r.setValue(50)
-        self.wb_b = QSpinBox(); self.wb_b.setRange(0, 100); self.wb_b.setValue(50)
-        self.brightness = QSpinBox(); self.brightness.setRange(0, 100); self.brightness.setValue(50)
+        self.wb_r = QSpinBox()
+        self.wb_r.setRange(0, 100)
+        self.wb_r.setValue(50)
+        self.wb_b = QSpinBox()
+        self.wb_b.setRange(0, 100)
+        self.wb_b.setValue(50)
+        self.brightness = QSpinBox()
+        self.brightness.setRange(0, 100)
+        self.brightness.setValue(50)
 
         self.combo_debayer = QComboBox()
         # Most common OpenCV Bayer conversions (RGB output)
@@ -1022,9 +1066,10 @@ class MainWindow(QMainWindow):
         self.combo_out.setCurrentText("PNG")
 
         self.total_label = QLabel("0")
-        self.total_label.setStyleSheet("color: rgba(255,255,255,200); font-weight: 700;")
+        self.total_label.setStyleSheet(
+            "color: rgba(255,255,255,200); font-weight: 700;")
 
-        for w in [self.exposure, self.gain, self.images_per_block, self.blocks, self.session_name,
+        for w in [self.exposure, self.gain, self.images_per_block, self.blocks, self.chk_pause, self.session_name,
                   self.combo_img_type, self.combo_bin, self.wb_r, self.wb_b, self.brightness,
                   self.combo_debayer, self.combo_out]:
             w.setStyleSheet("""
@@ -1048,6 +1093,7 @@ class MainWindow(QMainWindow):
         form.addRow("Formato salida", self.combo_out)
         form.addRow("Imágenes / bloque", self.images_per_block)
         form.addRow("Bloques", self.blocks)
+        form.addRow("Pausa en Bloques", self.chk_pause)
         form.addRow("Total imágenes", self.total_label)
         form.addRow("Nombre sesión", self.session_name)
 
@@ -1217,11 +1263,13 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         pm = self.preview.pixmap()
         if pm and not pm.isNull():
-            scaled = pm.scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            scaled = pm.scaled(self.preview.size(),
+                               Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.preview.setPixmap(scaled)
 
     def _update_total(self):
-        self.total_label.setText(str(self.images_per_block.value() * self.blocks.value()))
+        self.total_label.setText(
+            str(self.images_per_block.value() * self.blocks.value()))
 
     def _gather_params(self) -> CaptureParams:
         session_name = self.session_name.text().strip() or "Sesion"
@@ -1289,7 +1337,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "ZWO", msg)
             return
         if not self._cam_manager.is_connected():
-            QMessageBox.information(self, "ZWO", "Conecta una cámara primero (botón CÁMARA).")
+            QMessageBox.information(
+                self, "ZWO", "Conecta una cámara primero (botón CÁMARA).")
             return
 
         # Toggle: if live preview already running -> stop it
@@ -1308,15 +1357,19 @@ class MainWindow(QMainWindow):
 
         if self.chk_live.isChecked() or self.chk_video.isChecked():
             # (Video mode uses same loop for now; later we can swap to start_video_capture if your build supports it)
-            self._preview_worker = LivePreviewWorker(self._cam_manager, params, stop_flag)
+            self._preview_worker = LivePreviewWorker(
+                self._cam_manager, params, stop_flag)
             self._preview_worker.moveToThread(self._preview_thread)
             self._preview_thread.started.connect(self._preview_worker.run)
-            self._preview_worker.preview_ready.connect(self._on_live_preview_ready)
+            self._preview_worker.preview_ready.connect(
+                self._on_live_preview_ready)
             self._preview_worker.error.connect(self._on_error)
             self._preview_worker.finished.connect(self._on_preview_finished)
-            self._update_topbar("LIVE PREVIEW: ejecutando... (click PREVIEW para detener)")
+            self._update_topbar(
+                "LIVE PREVIEW: ejecutando... (click PREVIEW para detener)")
         else:
-            self._preview_worker = PreviewWorker(self._cam_manager, params, stop_flag)
+            self._preview_worker = PreviewWorker(
+                self._cam_manager, params, stop_flag)
             self._preview_worker.moveToThread(self._preview_thread)
             self._preview_thread.started.connect(self._preview_worker.run)
             self._preview_worker.preview_ready.connect(self._on_preview_ready)
@@ -1328,15 +1381,19 @@ class MainWindow(QMainWindow):
 
     def _on_preview_ready(self, qimg: QImage, exposure_s: float, gain: int, cam_name: str, mode: str):
         pm = QPixmap.fromImage(qimg)
-        scaled = pm.scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        scaled = pm.scaled(self.preview.size(),
+                           Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.preview.setPixmap(scaled)
-        self.lbl_seq.setText(f"PREVIEW | {mode} | EXP {exposure_s:.3f}s | GAIN {gain}")
+        self.lbl_seq.setText(
+            f"PREVIEW | {mode} | EXP {exposure_s:.3f}s | GAIN {gain}")
 
     def _on_live_preview_ready(self, qimg: QImage, exposure_s: float, gain: int, cam_name: str, mode: str, fps: float):
         pm = QPixmap.fromImage(qimg)
-        scaled = pm.scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        scaled = pm.scaled(self.preview.size(),
+                           Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.preview.setPixmap(scaled)
-        self.lbl_seq.setText(f"LIVE | {mode} | {fps:.1f} fps | EXP {exposure_s:.3f}s | GAIN {gain}")
+        self.lbl_seq.setText(
+            f"LIVE | {mode} | {fps:.1f} fps | EXP {exposure_s:.3f}s | GAIN {gain}")
 
     def _on_preview_finished(self):
         if self._preview_thread:
@@ -1360,7 +1417,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "ZWO", msg)
             return
         if not self._cam_manager.is_connected():
-            QMessageBox.information(self, "ZWO", "Conecta una cámara primero (botón CÁMARA).")
+            QMessageBox.information(
+                self, "ZWO", "Conecta una cámara primero (botón CÁMARA).")
             return
 
         # stop any preview loop
@@ -1370,10 +1428,12 @@ class MainWindow(QMainWindow):
         params = self._gather_params()
 
         self._worker_thread = QThread(self)
-        self._worker = CaptureWorker(base_path=self._base_path, cam_manager=self._cam_manager)
+        self._worker = CaptureWorker(
+            base_path=self._base_path, cam_manager=self._cam_manager)
         self._worker.moveToThread(self._worker_thread)
 
-        self._worker_thread.started.connect(lambda: self._worker.run_session(params))
+        self._worker_thread.started.connect(
+            lambda: self._worker.run_session(params))
         self._worker.frame_ready.connect(self._on_frame_ready)
         self._worker.state_changed.connect(self._on_state_changed)
         self._worker.error.connect(self._on_error)
@@ -1409,20 +1469,23 @@ class MainWindow(QMainWindow):
             self._worker = None
 
     def _on_frame_ready(self, qimg: QImage, saved_path: str,
-                       block_idx: int, blocks_total: int,
-                       idx_in_block: int, imgs_per_block: int,
-                       global_idx: int, exposure_s: float, gain: int, cam_name: str,
-                       mode: str):
+                        block_idx: int, blocks_total: int,
+                        idx_in_block: int, imgs_per_block: int,
+                        global_idx: int, exposure_s: float, gain: int, cam_name: str,
+                        mode: str):
         pm = QPixmap.fromImage(qimg)
-        scaled = pm.scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        scaled = pm.scaled(self.preview.size(),
+                           Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.preview.setPixmap(scaled)
 
         # Top bar sequence info
-        self.lbl_seq.setText(f"SEQ {block_idx}/{blocks_total} | IMG {idx_in_block}/{imgs_per_block} | global {global_idx} | {mode}")
+        self.lbl_seq.setText(
+            f"SEQ {block_idx}/{blocks_total} | IMG {idx_in_block}/{imgs_per_block} | global {global_idx} | {mode}")
 
     def _open_gallery(self):
         default_dir = self._session_dir if self._session_dir else self._base_path
-        w = GalleryWindow(self._base_path, default_session_dir=default_dir, parent=self)
+        w = GalleryWindow(
+            self._base_path, default_session_dir=default_dir, parent=self)
         w.show()
 
     def _toggle_fullscreen(self):
